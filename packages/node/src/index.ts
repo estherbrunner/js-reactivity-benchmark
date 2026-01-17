@@ -16,6 +16,9 @@ function logPerfResult(result: PerfResult): void {
       framework: result.framework,
       test: result.test,
       time: result.time.toFixed(2),
+      memoryUsed: result.memoryUsed?.toFixed(2),
+      heapUsed: result.heapUsed?.toFixed(2),
+      gcTime: result.gcTime?.toFixed(2),
     }),
   );
 }

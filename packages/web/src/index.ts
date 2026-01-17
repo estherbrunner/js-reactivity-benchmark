@@ -1,16 +1,16 @@
 import {
   formatPerfResult,
-  PerfResult,
+  frameworkInfo,
+  type PerfResult,
   perfResultHeaders,
   runTests,
-  frameworkInfo,
 } from "js-reactivity-benchmark/src/index";
 
-let data: PerfResult[] = [];
+const data: PerfResult[] = [];
 
 const pre = document.querySelector("pre")!;
 function logLine(line: string): void {
-  pre.innerText += line + "\n";
+  pre.innerText += `${line}\n`;
 }
 
 function logPerfResult(result: PerfResult): void {
@@ -20,6 +20,9 @@ function logPerfResult(result: PerfResult): void {
       framework: result.framework,
       test: result.test,
       time: result.time.toString(),
+      memoryUsed: result.memoryUsed?.toFixed(2),
+      heapUsed: result.heapUsed?.toFixed(2),
+      gcTime: result.gcTime?.toFixed(2),
     }),
   );
 }
@@ -124,7 +127,7 @@ function graph() {
         const time = groupedData[test][framework] ?? 0;
         const img = document.createElement("img");
         img.src = `pngs/${colors[frameworkIndex]}.png`;
-        img.style.width = Math.floor((800 * time) / maxTime) + "px";
+        img.style.width = `${Math.floor((800 * time) / maxTime)}px`;
         img.style.height = "20px";
         td.appendChild(img);
         tr.appendChild(td);

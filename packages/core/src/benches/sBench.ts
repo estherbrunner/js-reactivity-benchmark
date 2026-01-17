@@ -1,9 +1,13 @@
 // Inspired by https://github.com/solidjs/solid/blob/main/packages/solid/bench/bench.cjs
 
 import { nextTick } from "../util/asyncUtil";
-// import { fastestTest } from "../util/benchRepeat";
-import { PerfResultCallback } from "../util/perfLogging";
-import { Computed, ReactiveFramework, Signal } from "../util/reactiveFramework";
+import { benchmarkWithMemory } from "../util/benchRepeat";
+import type { PerfResultCallback } from "../util/perfLogging";
+import type {
+  Computed,
+  ReactiveFramework,
+  Signal,
+} from "../util/reactiveFramework";
 
 const COUNT = 1e5;
 
@@ -14,41 +18,86 @@ export async function sbench(
   framework: ReactiveFramework,
   logPerfResult: PerfResultCallback,
 ) {
-  const createSignalsTime = await run(createSignals, COUNT, COUNT);
+  const createSignalsResult = await run(createSignals, COUNT, COUNT);
   logPerfResult({
     framework: framework.name,
     test: "createSignals",
-    time: createSignalsTime,
+    time: createSignalsResult.time,
+    memoryUsed: createSignalsResult.memory?.memoryUsed,
+    heapUsed: createSignalsResult.memory?.heapUsed,
+    gcTime: createSignalsResult.memory?.gcTime,
   });
 
   let createTotal = 0;
-  createTotal += await run(create0to1, COUNT, 0);
-  createTotal += await run(create1to1, COUNT, COUNT);
-  createTotal += await run(create2to1, COUNT / 2, COUNT);
-  createTotal += await run(create4to1, COUNT / 4, COUNT);
-  createTotal += await run(create1000to1, COUNT / 1000, COUNT);
-  createTotal += await run(create1to2, COUNT, COUNT / 2);
-  createTotal += await run(create1to4, COUNT, COUNT / 4);
-  createTotal += await run(create1to8, COUNT, COUNT / 8);
-  createTotal += await run(create1to1000, COUNT, COUNT / 1000);
+  let createMemoryUsed = 0;
+  let createHeapUsed = 0;
+  let createGcTime = 0;
+  let createCount = 0;
+
+  const createResults = [
+    await run(create0to1, COUNT, 0),
+    await run(create1to1, COUNT, COUNT),
+    await run(create2to1, COUNT / 2, COUNT),
+    await run(create4to1, COUNT / 4, COUNT),
+    await run(create1000to1, COUNT / 1000, COUNT),
+    await run(create1to2, COUNT, COUNT / 2),
+    await run(create1to4, COUNT, COUNT / 4),
+    await run(create1to8, COUNT, COUNT / 8),
+    await run(create1to1000, COUNT, COUNT / 1000),
+  ];
+
+  for (const result of createResults) {
+    createTotal += result.time;
+    if (result.memory) {
+      createMemoryUsed += result.memory.memoryUsed;
+      createHeapUsed += result.memory.heapUsed;
+      createGcTime += result.memory.gcTime || 0;
+      createCount++;
+    }
+  }
+
   logPerfResult({
     framework: framework.name,
     test: "createComputations",
     time: createTotal,
+    memoryUsed: createCount > 0 ? createMemoryUsed : undefined,
+    heapUsed: createCount > 0 ? createHeapUsed : undefined,
+    gcTime: createCount > 0 ? createGcTime : undefined,
   });
 
   let updateTotal = 0;
-  updateTotal += await run(update1to1, COUNT * 4, 1);
-  updateTotal += await run(update2to1, COUNT * 2, 2);
-  updateTotal += await run(update4to1, COUNT, 4);
-  updateTotal += await run(update1000to1, COUNT / 250, 1000);
-  updateTotal += await run(update1to2, COUNT, 1);
-  updateTotal += await run(update1to4, COUNT, 1);
-  updateTotal += await run(update1to1000, COUNT, 1);
+  let updateMemoryUsed = 0;
+  let updateHeapUsed = 0;
+  let updateGcTime = 0;
+  let updateCount = 0;
+
+  const updateResults = [
+    await run(update1to1, COUNT * 4, 1),
+    await run(update2to1, COUNT * 2, 2),
+    await run(update4to1, COUNT, 4),
+    await run(update1000to1, COUNT / 250, 1000),
+    await run(update1to2, COUNT, 1),
+    await run(update1to4, COUNT, 1),
+    await run(update1to1000, COUNT, 1),
+  ];
+
+  for (const result of updateResults) {
+    updateTotal += result.time;
+    if (result.memory) {
+      updateMemoryUsed += result.memory.memoryUsed;
+      updateHeapUsed += result.memory.heapUsed;
+      updateGcTime += result.memory.gcTime || 0;
+      updateCount++;
+    }
+  }
+
   logPerfResult({
     framework: framework.name,
     test: "updateSignals",
     time: updateTotal,
+    memoryUsed: updateCount > 0 ? updateMemoryUsed : undefined,
+    heapUsed: updateCount > 0 ? updateHeapUsed : undefined,
+    gcTime: updateCount > 0 ? updateGcTime : undefined,
   });
 
   async function run(
@@ -59,7 +108,7 @@ export async function sbench(
     let sources: Signal<number>[] | null;
     if (globalThis.gc) (gc!(), gc!());
     for (let i = 0; i < 3; i++) {
-      let warmupUpdate = framework.withBuild(() => {
+      const warmupUpdate = framework.withBuild(() => {
         // run 3 times to warm up
         sources = [];
         createSignals(scount, sources);
@@ -70,42 +119,62 @@ export async function sbench(
     sources = null;
     framework.cleanup();
 
-    // start GC clean
-    if (globalThis.gc) (gc!(), gc!());
-    await nextTick();
+    // Use benchmarkWithMemory if GC is available
+    if (globalThis.gc) {
+      const result = await benchmarkWithMemory(10, () => {
+        const update = framework.withBuild(() => {
+          sources = [];
+          createSignals(scount, sources);
+          for (let i = 0; i < scount; i++) {
+            sources[i].read();
+            sources[i].read();
+            sources[i].read();
+          }
+          return fn(n, sources);
+        });
 
-    let fastestTime = Infinity;
-    for (let i = 0; i < 10; i++) {
-      let start = 0;
-      let end = 0;
-      let update = framework.withBuild(() => {
-        sources = [];
-        createSignals(scount, sources);
-        for (let i = 0; i < scount; i++) {
-          sources[i].read();
-          sources[i].read();
-          sources[i].read();
-        }
-
-        start = performance.now();
-
-        return fn(n, sources);
+        update();
+        sources = null;
+        framework.cleanup();
+        return 0; // dummy return value
       });
 
-      update();
-      sources = null;
-      framework.cleanup();
-      end = performance.now();
-
-      // end GC clean
+      return result;
+    } else {
+      // Fallback to simple timing without memory tracking
       if (globalThis.gc) (gc!(), gc!());
+      await nextTick();
 
-      let time = end - start;
-      if (time < fastestTime) {
-        fastestTime = time;
+      let fastestTime = Infinity;
+      for (let i = 0; i < 10; i++) {
+        let start = 0;
+        let end = 0;
+        const update = framework.withBuild(() => {
+          sources = [];
+          createSignals(scount, sources);
+          for (let i = 0; i < scount; i++) {
+            sources[i].read();
+            sources[i].read();
+            sources[i].read();
+          }
+
+          start = performance.now();
+
+          return fn(n, sources);
+        });
+
+        update();
+        sources = null;
+        framework.cleanup();
+        end = performance.now();
+
+        const time = end - start;
+        if (time < fastestTime) {
+          fastestTime = time;
+        }
       }
+      return { time: fastestTime, result: 0 };
     }
-    return fastestTime;
   }
 
   function createSignals(n: number, sources: Computed<number>[]) {
@@ -233,7 +302,7 @@ export async function sbench(
   }
 
   function update1to1(n: number, sources: Signal<number>[]) {
-    let { read: get1, write: set1 } = sources[0];
+    const { read: get1, write: set1 } = sources[0];
     framework.effect(() => get1());
     return () => {
       for (let i = 0; i < n; i++) {
@@ -245,7 +314,7 @@ export async function sbench(
   }
 
   function update2to1(n: number, sources: Signal<number>[]) {
-    let { read: get1, write: set1 } = sources[0],
+    const { read: get1, write: set1 } = sources[0],
       { read: get2 } = sources[1];
     framework.effect(() => get1() + get2());
     return () => {
@@ -258,7 +327,7 @@ export async function sbench(
   }
 
   function update4to1(n: number, sources: Signal<number>[]) {
-    let { read: get1, write: set1 } = sources[0],
+    const { read: get1, write: set1 } = sources[0],
       { read: get2 } = sources[1],
       { read: get3 } = sources[2],
       { read: get4 } = sources[3];
@@ -273,7 +342,7 @@ export async function sbench(
   }
 
   function update1000to1(n: number, sources: Signal<number>[]) {
-    let { write: set1 } = sources[0];
+    const { write: set1 } = sources[0];
     framework.effect(() => {
       let sum = 0;
       for (let i = 0; i < 1000; i++) {
@@ -291,7 +360,7 @@ export async function sbench(
   }
 
   function update1to2(n: number, sources: Signal<number>[]) {
-    let { read: get1, write: set1 } = sources[0];
+    const { read: get1, write: set1 } = sources[0];
     framework.effect(() => get1());
     framework.effect(() => get1());
     return () => {
@@ -304,7 +373,7 @@ export async function sbench(
   }
 
   function update1to4(n: number, sources: Signal<number>[]) {
-    let { read: get1, write: set1 } = sources[0];
+    const { read: get1, write: set1 } = sources[0];
     framework.effect(() => get1());
     framework.effect(() => get1());
     framework.effect(() => get1());

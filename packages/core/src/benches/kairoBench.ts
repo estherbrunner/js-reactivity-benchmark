@@ -1,16 +1,16 @@
+import { nextTick } from "../util/asyncUtil";
+import { benchmarkWithMemory, fastestTest } from "../util/benchRepeat";
+import type { FrameworkInfo } from "../util/frameworkTypes";
+import type { PerfResultCallback } from "../util/perfLogging";
 import { avoidablePropagation } from "./kairo/avoidable";
 import { broadPropagation } from "./kairo/broad";
 import { deepPropagation } from "./kairo/deep";
 import { diamond } from "./kairo/diamond";
+import { mol } from "./kairo/molBench";
 import { mux } from "./kairo/mux";
 import { repeatedObservers } from "./kairo/repeated";
 import { triangle } from "./kairo/triangle";
 import { unstable } from "./kairo/unstable";
-import { nextTick } from "../util/asyncUtil";
-import { fastestTest } from "../util/benchRepeat";
-import { PerfResultCallback } from "../util/perfLogging";
-import { FrameworkInfo } from "../util/frameworkTypes";
-import { mol } from "./kairo/molBench";
 
 const cases = [
   { name: "avoidablePropagation", fn: avoidablePropagation },
@@ -61,20 +61,41 @@ export async function kairoBench(
       iter();
       await nextTick();
 
-      const { time } = await fastestTest(10, () => {
-        for (let i = 0; i < 500; i++) {
-          iter();
-        }
-      });
+      if (globalThis.gc) {
+        // Use benchmarkWithMemory when GC is available
+        const result = await benchmarkWithMemory(10, () => {
+          for (let i = 0; i < 500; i++) {
+            iter();
+          }
+          return 0; // dummy return value
+        });
 
-      framework.cleanup();
-      if (globalThis.gc) (gc!(), gc!());
+        framework.cleanup();
 
-      logPerfResult({
-        framework: framework.name,
-        test: c.name,
-        time,
-      });
+        logPerfResult({
+          framework: framework.name,
+          test: c.name,
+          time: result.time,
+          memoryUsed: result.memory?.memoryUsed,
+          heapUsed: result.memory?.heapUsed,
+          gcTime: result.memory?.gcTime,
+        });
+      } else {
+        // Fallback to simple timing
+        const { time } = await fastestTest(10, () => {
+          for (let i = 0; i < 500; i++) {
+            iter();
+          }
+        });
+
+        framework.cleanup();
+
+        logPerfResult({
+          framework: framework.name,
+          test: c.name,
+          time,
+        });
+      }
     }
   }
 }

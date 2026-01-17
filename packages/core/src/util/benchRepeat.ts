@@ -48,12 +48,23 @@ export async function fastestTest<T>(
   return fastest;
 }
 
-/** benchmark a function with memory tracking */
+/**
+ * Benchmark a function with memory tracking.
+ *
+ * Memory Measurement Approach:
+ * - Measures runtime memory overhead (not setup/initialization memory)
+ * - Forces GC before measurement to establish a clean baseline
+ * - Tracks peak memory usage across all benchmark runs
+ * - Returns timing from the fastest run, but memory from peak across all runs
+ *
+ * Note: Small or zero heap values indicate the function has minimal runtime
+ * memory overhead beyond what was allocated during initialization.
+ */
 export async function benchmarkWithMemory<T>(
   times: number,
   fn: () => T,
 ): Promise<TimingResult<T> & { memory?: MemoryResult }> {
-  // Force GC and wait to settle
+  // Force GC and wait to settle - establishes clean baseline
   forceGC();
   forceGC();
   await nextTick();
@@ -63,17 +74,17 @@ export async function benchmarkWithMemory<T>(
   let peakHeap = 0;
   let peakTotal = 0;
 
-  // Run tests and track peak memory
+  // Run tests and track peak memory across all runs
   const results: TimingResult<T>[] = [];
   for (let i = 0; i < times; i++) {
     await nextTick();
 
-    // Measure before run
+    // Measure before and after each run
     const beforeRun = getMemoryUsage();
     const run = runTimed(fn);
     const afterRun = getMemoryUsage();
 
-    // Track peak usage during this run
+    // Track peak usage across all runs
     if (afterRun && beforeRun) {
       const heapUsed = afterRun.heapUsed;
       const totalUsed = afterRun.heapTotal + afterRun.external;
@@ -91,26 +102,16 @@ export async function benchmarkWithMemory<T>(
   forceGC();
   const gcTime = performance.now() - gcStart;
 
-  await nextTick();
-  const memAfter = getMemoryUsage();
-
   let memory: MemoryResult | undefined;
-  if (memBefore && memAfter) {
-    // Use peak values if available, otherwise use deltas
-    const heapUsed =
-      peakHeap > 0
-        ? peakHeap - memBefore.heapUsed
-        : memAfter.heapUsed - memBefore.heapUsed;
-    const totalUsed =
-      peakTotal > 0
-        ? peakTotal - (memBefore.heapTotal + memBefore.external)
-        : memAfter.heapTotal +
-          memAfter.external -
-          (memBefore.heapTotal + memBefore.external);
+  if (memBefore && peakHeap > 0 && peakTotal > 0) {
+    // Calculate delta from baseline using peak values
+    // This avoids negative values that would occur from post-GC measurements
+    const heapUsed = peakHeap - memBefore.heapUsed;
+    const totalUsed = peakTotal - (memBefore.heapTotal + memBefore.external);
 
     memory = {
-      memoryUsed: totalUsed / (1024 * 1024), // Convert to MB
-      heapUsed: heapUsed / (1024 * 1024), // Convert to MB
+      memoryUsed: Math.max(0, totalUsed / (1024 * 1024)), // Convert to MB, clamp to non-negative
+      heapUsed: Math.max(0, heapUsed / (1024 * 1024)), // Convert to MB, clamp to non-negative
       gcTime: gcTime,
     };
   }

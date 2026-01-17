@@ -1,18 +1,18 @@
-import { makeGraph, runGraph } from "./dependencyGraph";
-import { verifyBenchResult } from "../../util/perfTests";
-import { FrameworkInfo, TestConfig } from "../../util/frameworkTypes";
 import { perfTests } from "../../config";
-import { benchmarkWithMemory } from "../../util/benchRepeat";
-import { PerfResultCallback } from "../../util/perfLogging";
 import { nextTick } from "../../util/asyncUtil";
+import { benchmarkWithMemory } from "../../util/benchRepeat";
+import type { FrameworkInfo, TestConfig } from "../../util/frameworkTypes";
+import type { PerfResultCallback } from "../../util/perfLogging";
+import { verifyBenchResult } from "../../util/perfTests";
+import { makeGraph, runGraph } from "./dependencyGraph";
 
 function percent(n: number): string {
-  return Math.round(n * 100) + "%";
+  return `${Math.round(n * 100)}%`;
 }
 
 export function makeTitle(config: TestConfig): string {
   const { width, totalLayers, staticFraction, nSources, readFraction } = config;
-  const dyn = staticFraction < 1 ? " - dyn" + percent(1 - staticFraction) : "";
+  const dyn = staticFraction < 1 ? ` - dyn${percent(1 - staticFraction)}` : "";
   const read = readFraction < 1 ? ` - lazy${percent(1 - readFraction)}` : "";
   return `${nSources}-${width}x${totalLayers}${dyn}${read}`;
 }

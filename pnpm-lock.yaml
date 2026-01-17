@@ -33,8 +33,8 @@ importers:
         specifier: ^3.5.26
         version: 3.5.26
       '@zeix/cause-effect':
-        specifier: 0.11.0
-        version: 0.11.0(typescript@5.9.3)
+        specifier: 0.17.3
+        version: 0.17.3(typescript@5.9.3)
       alien-signals:
         specifier: ^2.0.8
         version: 2.0.8
@@ -984,8 +984,8 @@ packages:
   '@vue/shared@3.5.26':
     resolution: {integrity: sha512-7Z6/y3uFI5PRoKeorTOSXKcDj0MSasfNNltcslbFrPpcw6aXRUALq4IfJlaTRspiWIUOEZbrpM+iQGmCOiWe4A==}
 
-  '@zeix/cause-effect@0.11.0':
-    resolution: {integrity: sha512-8bCsEv2OhIa2Az9Ok2mQkQAJeFGLRYbjvoCXBdOEBA7ACAEm386ijzBz2HXlE4rQyQkXaNKRqvAxTnYvilM83w==}
+  '@zeix/cause-effect@0.17.3':
+    resolution: {integrity: sha512-FN0HsS8GKyYwdiMrhK43v4c4HJo+Uylz4z2zNcNgogGdxn0pLOjNuwDAxwWd6ihjvrq8ZIiggOtaxNKb5lwmKA==}
     peerDependencies:
       typescript: ^5.6.3
 
@@ -2160,7 +2160,7 @@ snapshots:
 
   '@vue/shared@3.5.26': {}
 
-  '@zeix/cause-effect@0.11.0(typescript@5.9.3)':
+  '@zeix/cause-effect@0.17.3(typescript@5.9.3)':
     dependencies:
       typescript: 5.9.3
 

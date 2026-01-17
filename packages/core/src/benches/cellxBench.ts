@@ -1,8 +1,9 @@
 // The following is an implementation of the cellx benchmark https://github.com/Riim/cellx/blob/master/perf/perf.html
 import { nextTick } from "../util/asyncUtil";
-import { FrameworkInfo } from "../util/frameworkTypes";
-import { PerfResultCallback } from "../util/perfLogging";
-import { Computed, ReactiveFramework } from "../util/reactiveFramework";
+import { benchmarkWithMemory } from "../util/benchRepeat";
+import type { FrameworkInfo } from "../util/frameworkTypes";
+import type { PerfResultCallback } from "../util/perfLogging";
+import type { Computed, ReactiveFramework } from "../util/reactiveFramework";
 
 const cellx = (framework: ReactiveFramework, layers: number) => {
   const iter = framework.withBuild(() => {
@@ -70,7 +71,7 @@ const cellx = (framework: ReactiveFramework, layers: number) => {
     };
   });
 
-  let result = iter();
+  const result = iter();
 
   framework.cleanup();
   if (globalThis.gc) (gc!(), gc!());
@@ -134,22 +135,41 @@ export const cellxbench = async (
     const results: Record<number, BenchmarkResults> = {};
 
     for (const layers in expected) {
-      let total = 0;
-      for (let i = 0; i < 10; i++) {
-        await nextTick();
+      if (globalThis.gc) {
+        // Use benchmarkWithMemory when GC is available
+        const result = await benchmarkWithMemory(10, () => {
+          const [elapsed, before, after] = cellx(framework, Number(layers));
+          results[layers] = [before, after];
+          return elapsed;
+        });
 
-        const [elapsed, before, after] = cellx(framework, Number(layers));
+        logPerfResult({
+          framework: framework.name,
+          test: `cellx${layers}`,
+          time: result.time,
+          memoryUsed: result.memory?.memoryUsed,
+          heapUsed: result.memory?.heapUsed,
+          gcTime: result.memory?.gcTime,
+        });
+      } else {
+        // Fallback to simple timing
+        let total = 0;
+        for (let i = 0; i < 10; i++) {
+          await nextTick();
 
-        results[layers] = [before, after];
+          const [elapsed, before, after] = cellx(framework, Number(layers));
 
-        total += elapsed;
+          results[layers] = [before, after];
+
+          total += elapsed;
+        }
+
+        logPerfResult({
+          framework: framework.name,
+          test: `cellx${layers}`,
+          time: total,
+        });
       }
-
-      logPerfResult({
-        framework: framework.name,
-        test: `cellx${layers}`,
-        time: total,
-      });
     }
 
     for (const layers in expected) {
