@@ -3,7 +3,9 @@
   "version": "0.0.0",
   "scripts": {
     "build": "esbuild src/index.ts --bundle --format=esm --target=esnext --outdir=dist --sourcemap=external",
-    "run": "node dist/index.js"
+    "run": "node dist/index.js",
+    "bench": "bun dist/index.js",
+    "bench:memory": "bun --expose-gc dist/index.js"
   },
   "dependencies": {
     "@types/node": "^24.3.0",

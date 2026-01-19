@@ -1,6 +1,6 @@
 import type { FrameworkInfo } from "./util/frameworkTypes";
 import { alienFramework } from "./frameworks/alienSignals";
-// import { angularFramework as angularFramework2 } from "./frameworks/angularSignals2";
+import { angularFramework as angularFramework2 } from "./frameworks/angularSignals2";
 // import { causeEffectFramework } from "./frameworks/causeEffect";
 import { cfxFramework } from "./frameworks/cfx";
 import { cfxR3Framework } from "./frameworks/cfxR3";
@@ -8,14 +8,14 @@ import { cfxR3Framework } from "./frameworks/cfxR3";
 // import { mobxFramework } from "./frameworks/inactive/mobx";
 import { preactSignalFramework } from "./frameworks/preactSignals";
 // import { r3Framework } from "./frameworks/r3";
-// import { reactivelyFramework } from "./frameworks/reactively";
+import { reactivelyFramework } from "./frameworks/reactively";
 // import { sFramework } from "./frameworks/inactive/s";
-// import { solidFramework } from "./frameworks/solid";
+import { solidFramework } from "./frameworks/solid";
 // import { potaFramework } from "./frameworks/pota";
-// import { svelteFramework } from "./frameworks/svelte";
+import { svelteFramework } from "./frameworks/svelte";
 // import { tansuFramework } from "./frameworks/tansu";
 // import { usignalFramework } from "./frameworks/inactive/uSignal";
-// import { vueReactivityFramework } from "./frameworks/inactive/vueReactivity";
+import { vueReactivityFramework } from "./frameworks/inactive/vueReactivity";
 // import { xReactivityFramework } from "./frameworks/xReactivity";
 
 // Currently failing kairoBench tests
@@ -29,7 +29,7 @@ import { preactSignalFramework } from "./frameworks/preactSignals";
 
 export const frameworkInfo: FrameworkInfo[] = [
   { framework: alienFramework, testPullCounts: true },
-  // { framework: angularFramework2, testPullCounts: true },
+  { framework: angularFramework2, testPullCounts: true },
   // { framework: causeEffectFramework, testPullCounts: true },
   { framework: cfxFramework, testPullCounts: true },
   { framework: cfxR3Framework, testPullCounts: true },
@@ -37,19 +37,19 @@ export const frameworkInfo: FrameworkInfo[] = [
   // { framework: mobxFramework, testPullCounts: true },
   { framework: preactSignalFramework, testPullCounts: true },
   // { framework: r3Framework, testPullCounts: false },
-  // { framework: reactivelyFramework, testPullCounts: true },
+  { framework: reactivelyFramework, testPullCounts: true },
   // { framework: sFramework },
-  // { framework: solidFramework }, // solid can't testPullCounts because batch executes all leaf nodes even if unread
+  { framework: solidFramework }, // solid can't testPullCounts because batch executes all leaf nodes even if unread
   // { framework: potaFramework },
-  // { framework: svelteFramework, testPullCounts: true },
+  { framework: svelteFramework, testPullCounts: true },
   // { framework: tansuFramework, testPullCounts: true },
-  // { framework: vueReactivityFramework, testPullCounts: true },
+  { framework: vueReactivityFramework, testPullCounts: true },
   // { framework: xReactivityFramework, testPullCounts: true },
 ];
 
 export const allFrameworks: FrameworkInfo[] = [
   { framework: alienFramework, testPullCounts: true },
-  // { framework: angularFramework2, testPullCounts: true },
+  { framework: angularFramework2, testPullCounts: true },
   // { framework: causeEffectFramework, testPullCounts: true },
   { framework: cfxFramework, testPullCounts: true },
   { framework: cfxR3Framework, testPullCounts: true },
@@ -59,14 +59,14 @@ export const allFrameworks: FrameworkInfo[] = [
   // { framework: obyFramework, testPullCounts: true },
   { framework: preactSignalFramework, testPullCounts: true },
   // { framework: r3Framework, testPullCounts: false },
-  // { framework: reactivelyFramework, testPullCounts: true },
+  { framework: reactivelyFramework, testPullCounts: true },
   // { framework: sFramework },
-  // { framework: solidFramework }, // solid can't testPullCounts because batch executes all leaf nodes even if unread
+  { framework: solidFramework }, // solid can't testPullCounts because batch executes all leaf nodes even if unread
   // { framework: potaFramework },
-  // { framework: svelteFramework, testPullCounts: true },
+  { framework: svelteFramework, testPullCounts: true },
   // { framework: tansuFramework, testPullCounts: true },
   // { framework: tc39SignalsFramework, testPullCounts: true },
   // { framework: usignalFramework, testPullCounts: true },
-  // { framework: vueReactivityFramework, testPullCounts: true },
+  { framework: vueReactivityFramework, testPullCounts: true },
   // { framework: xReactivityFramework, testPullCounts: true },
 ];

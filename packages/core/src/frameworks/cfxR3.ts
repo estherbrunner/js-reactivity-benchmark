@@ -21,9 +21,20 @@ type CacheFlag =
   | typeof CACHE_DIRTY
   | typeof CACHE_RECOMPUTING;
 
+type TaskState =
+  | typeof TASK_IDLE
+  | typeof TASK_PENDING
+  | typeof TASK_ABORTED
+  | typeof TASK_ERROR;
+
+type TaskCallback<T extends {}> = (
+  oldValue: T,
+  abort: AbortSignal,
+) => Promise<T>;
+
 export interface Link {
-  dep: UnknownSignal | UnknownComputed;
-  sub: UnknownComputed;
+  dep: UnknownSignal | UnknownComputed | UnknownTask;
+  sub: UnknownComputed | UnknownTask;
   nextDep: Link | null;
   prevSub: Link | null;
   nextSub: Link | null;
@@ -48,11 +59,24 @@ export interface Computed<T> extends RawSignal<T> {
   deps: Link | null;
   depsTail: Link | null;
   flags: CacheFlag;
-  height: number;
   disposal: Disposable | Disposable[] | null;
   fn: () => T;
   child: UnknownFirewallSignal | null;
 }
+
+export interface Task<T extends {}> extends RawSignal<T> {
+  deps: Link | null;
+  depsTail: Link | null;
+  flags: CacheFlag;
+  disposal: Disposable | Disposable[] | null;
+  fn: TaskCallback<T>;
+  child: UnknownFirewallSignal | null;
+  state: TaskState;
+  controller: AbortController | undefined;
+  error: Error | undefined;
+}
+
+type UnknownTask = Task<unknown & {}>;
 
 /* === Constants === */
 
@@ -61,9 +85,14 @@ const CACHE_CHECK = 1 << 0; // Signal value might be stale, check parent nodes t
 const CACHE_DIRTY = 1 << 1; // Signal value is invalid, parents have changed, value needs to be recomputed
 const CACHE_RECOMPUTING = 1 << 2; // Signal value is being recomputed
 
+const TASK_IDLE = 0;
+const TASK_PENDING = 1;
+const TASK_ABORTED = 2;
+const TASK_ERROR = 3;
+
 /* === Internals === */
 
-let context: UnknownComputed | null = null;
+let context: UnknownComputed | UnknownTask | null = null;
 const queuedEffects: UnknownComputed[] = [];
 let batchDepth = 0;
 
@@ -106,11 +135,10 @@ export function createMemo<T>(
   fn: () => T,
   options?: SignalOptions<NonNullable<T>>,
 ): Computed<T> {
-  const self: Computed<T> = {
+  return {
     disposal: null,
     fn: fn,
     value: undefined as unknown as T,
-    height: 0,
     child: null,
     deps: null,
     depsTail: null,
@@ -118,14 +146,88 @@ export function createMemo<T>(
     subsTail: null,
     flags: CACHE_DIRTY,
     equals: options?.equals || ((a: unknown, b: unknown) => a === b),
+  } as Computed<T>;
+}
+
+/**
+ * Create an async computed signal (Task) that awaits promises.
+ *
+ * Features:
+ * - Automatically tracks dependencies like computed signals
+ * - Provides AbortSignal to cancel in-flight work when dependencies change
+ * - Catches errors and rethrows them on read() (colorless error propagation)
+ * - Returns last committed value while pending
+ *
+ * @example
+ * const userId = createState(1);
+ * const userData = createTask(async (prev, signal) => {
+ *   const id = read(userId);
+ *   const response = await fetch(`/api/users/${id}`, { signal });
+ *   return response.json();
+ * }, initialUserData);
+ */
+export function createTask<T extends {}>(
+  fn: TaskCallback<T>,
+  initialValue: T,
+  options?: SignalOptions<NonNullable<T>>,
+): Task<T> {
+  validateSignalValue("Task", initialValue, options?.guard);
+
+  return {
+    disposal: null,
+    fn: fn,
+    value: initialValue,
+    child: null,
+    deps: null,
+    depsTail: null,
+    subs: null,
+    subsTail: null,
+    flags: CACHE_DIRTY,
+    equals: options?.equals || ((a: unknown, b: unknown) => a === b),
+    guard: options?.guard,
+    state: TASK_IDLE,
+    controller: undefined,
+    error: undefined,
   };
+}
 
-  if (context) {
-    self.height = context.height + 1;
-    link(self, context);
-  }
+/**
+ * Check if a task is currently pending (executing async work).
+ */
+export function isPending<T extends {}>(task: Task<T>): boolean {
+  return task.state === TASK_PENDING;
+}
 
-  return self;
+/**
+ * Abort a task's in-flight execution.
+ */
+export function abortTask<T extends {}>(task: Task<T>): void {
+  task.controller?.abort();
+  task.controller = undefined;
+  if (task.state === TASK_PENDING) task.state = TASK_ABORTED;
+}
+
+/**
+ * Dispose a task, aborting in-flight work and unlinking from the reactive graph.
+ */
+export function disposeTask<T extends {}>(task: Task<T>): void {
+  abortTask(task);
+
+  // Unlink from dependencies
+  let dep = task.deps;
+  while (dep !== null) dep = unlinkSubs(dep);
+  task.deps = null;
+
+  // Run disposal callbacks
+  runDisposal(task as unknown as UnknownTask);
+
+  // Clear subscribers
+  task.subs = null;
+  task.subsTail = null;
+
+  // Keep last committed value; clear error so it doesn't throw after disposal
+  task.error = undefined;
+  task.state = TASK_IDLE;
 }
 
 export function createState<T extends {}>(
@@ -205,18 +307,119 @@ function recompute(el: UnknownComputed) {
   el.flags = CACHE_CLEAN;
 }
 
-function updateIfNecessary(el: UnknownComputed): void {
+function recomputeTask(el: UnknownTask) {
+  if (el.state === TASK_PENDING) return;
+
+  // Abort any previous run
+  el.controller?.abort();
+
+  const controller = new AbortController();
+  el.controller = controller;
+
+  const oldValue = el.value;
+
+  el.state = TASK_PENDING;
+  el.error = undefined;
+
+  runDisposal(el);
+  const oldcontext = context;
+  context = el;
+  el.depsTail = null;
+  el.flags = CACHE_RECOMPUTING;
+
+  let promise: Promise<unknown>;
+  try {
+    promise = el.fn(oldValue, controller.signal);
+
+    const depsTail = el.depsTail as Link | null;
+    let toRemove = depsTail !== null ? depsTail.nextDep : el.deps;
+    if (toRemove) {
+      do {
+        toRemove = unlinkSubs(toRemove);
+      } while (toRemove !== null);
+      // biome-ignore lint/suspicious/noAssignInExpressions: micro-optimization
+      depsTail ? (depsTail.nextDep = null) : (el.deps = null);
+    }
+  } catch (e) {
+    // Synchronous throw from callback: treat as immediate error, keep old committed value
+    context = oldcontext;
+    el.state = TASK_ERROR;
+    el.controller = undefined;
+    el.error = e instanceof Error ? e : new Error(String(e));
+    el.flags = CACHE_CLEAN;
+    return;
+  }
+
+  context = oldcontext;
+
+  promise.then(
+    (next) => {
+      if (controller.signal.aborted) return;
+
+      el.controller = undefined;
+      el.state = TASK_IDLE;
+      el.error = undefined;
+
+      // Only update if value changed
+      if (!el.equals?.(next, el.value)) {
+        el.value = next as typeof el.value;
+
+        // Mark subscribers as dirty/check
+        for (let s = el.subs; s !== null; s = s.nextSub) {
+          const o = s.sub;
+          const flags = o.flags;
+          flags & CACHE_CHECK
+            ? // biome-ignore lint/suspicious/noAssignInExpressions: micro-optimization
+              (o.flags = flags | CACHE_DIRTY)
+            : markNode(o, CACHE_DIRTY);
+        }
+      }
+
+      el.flags = CACHE_CLEAN;
+    },
+    (err: unknown) => {
+      if (controller.signal.aborted) return;
+
+      // On error: do not commit value; keep last committed
+      el.controller = undefined;
+      el.state = TASK_ERROR;
+      el.error = err instanceof Error ? err : new Error(String(err));
+
+      // Notify dependents so they can react/throw if they read
+      for (let s = el.subs; s !== null; s = s.nextSub) {
+        const o = s.sub;
+        const flags = o.flags;
+        flags & CACHE_CHECK
+          ? // biome-ignore lint/suspicious/noAssignInExpressions: micro-optimization
+            (o.flags = flags | CACHE_DIRTY)
+          : markNode(o, CACHE_CHECK);
+      }
+
+      el.flags = CACHE_CLEAN;
+    },
+  );
+}
+
+function updateIfNecessary(el: UnknownComputed | UnknownTask): void {
   // If marked Check, recursively update dependencies to see if we're actually dirty
   if (el.flags & CACHE_CHECK) {
     for (let d = el.deps; d !== null; d = d.nextDep) {
-      "fn" in d.dep && updateIfNecessary(d.dep);
+      "fn" in d.dep &&
+        updateIfNecessary(d.dep as UnknownComputed | UnknownTask);
       // Early exit if dependency recomputation escalated us to Dirty
       if (el.flags & CACHE_DIRTY) break;
     }
   }
 
   // Only recompute if we're actually Dirty (not just Check)
-  el.flags & CACHE_DIRTY && recompute(el);
+  if (el.flags & CACHE_DIRTY) {
+    // Check if this is a Task
+    if ("state" in el) {
+      recomputeTask(el as UnknownTask);
+    } else {
+      recompute(el as UnknownComputed);
+    }
+  }
 
   // Clear flags after checking/recomputing
   el.flags = CACHE_CLEAN;
@@ -242,7 +445,7 @@ function unlinkSubs(link: Link): Link | null {
   return nextDep;
 }
 
-function unwatched(el: UnknownComputed) {
+function unwatched(el: UnknownComputed | UnknownTask) {
   let dep = el.deps;
   while (dep !== null) dep = unlinkSubs(dep);
   el.deps = null;
@@ -250,7 +453,10 @@ function unwatched(el: UnknownComputed) {
 }
 
 // https://github.com/stackblitz/alien-signals/blob/v2.0.3/src/system.ts#L52
-function link(dep: UnknownSignal | UnknownComputed, sub: UnknownComputed) {
+function link(
+  dep: UnknownSignal | UnknownComputed | UnknownTask,
+  sub: UnknownComputed | UnknownTask,
+) {
   const prevDep = sub.depsTail;
   if (prevDep !== null && prevDep.dep === dep) return;
   let nextDep: Link | null = null;
@@ -290,7 +496,10 @@ function link(dep: UnknownSignal | UnknownComputed, sub: UnknownComputed) {
 }
 
 // https://github.com/stackblitz/alien-signals/blob/v2.0.3/src/system.ts#L284
-function isValidLink(checkLink: Link, sub: UnknownComputed): boolean {
+function isValidLink(
+  checkLink: Link,
+  sub: UnknownComputed | UnknownTask,
+): boolean {
   const depsTail = sub.depsTail;
   if (depsTail !== null) {
     // biome-ignore lint/style/noNonNullAssertion: we know what we're doing
@@ -305,24 +514,23 @@ function isValidLink(checkLink: Link, sub: UnknownComputed): boolean {
   return false;
 }
 
-export function read<T>(el: Signal<NonNullable<T>> | Computed<T>): T {
-  // Link to current reactive context
-  if (context) {
-    link(el, context);
+export function read<T>(
+  el: Signal<NonNullable<T>> | Computed<T> | Task<T & {}>,
+): T {
+  // Update computed if dirty (pull-based)
+  const owner = ("owner" in el ? el.owner : el) as
+    | UnknownComputed
+    | UnknownTask;
+  if ("fn" in owner && owner.flags & (CACHE_DIRTY | CACHE_CHECK))
+    updateIfNecessary(owner);
 
-    const owner = "owner" in el ? el.owner : el;
-    if ("fn" in owner) {
-      owner.height >= context.height &&
-        // biome-ignore lint/suspicious/noAssignInExpressions: micro-optimization
-        (context.height = owner.height + 1);
-      if (owner.flags & (CACHE_DIRTY | CACHE_CHECK)) updateIfNecessary(owner);
-    }
-  } else {
-    // Even outside reactive context, update computed if dirty
-    const owner = "owner" in el ? el.owner : el;
-    if ("fn" in owner && owner.flags & (CACHE_DIRTY | CACHE_CHECK))
-      updateIfNecessary(owner);
-  }
+  // Link to current reactive context for dependency tracking
+  if (context)
+    link(el as UnknownSignal | UnknownComputed | UnknownTask, context);
+
+  // Rethrow error if task failed (colorless error propagation)
+  if ("error" in el && el.error) throw el.error;
+
   return el.value;
 }
 
@@ -338,15 +546,22 @@ export function setSignal<T extends unknown & {}>(el: Signal<T>, v: T) {
   if (batchDepth === 0) flush();
 }
 
-function markNode(el: UnknownComputed, newState = CACHE_DIRTY) {
+function markNode(el: UnknownComputed | UnknownTask, newState = CACHE_DIRTY) {
   const flags = el.flags;
   if ((flags & (CACHE_DIRTY | CACHE_CHECK)) >= newState) return;
 
   el.flags = flags | newState;
 
+  // Special handling for tasks: abort in-flight work when dependencies change
+  if ("state" in el && el.state === TASK_PENDING) {
+    el.controller?.abort();
+    el.controller = undefined;
+    el.state = TASK_ABORTED;
+  }
+
   // Effects have equals === null - collect them for later execution
   if (el.equals === null && !(flags & (CACHE_DIRTY | CACHE_CHECK))) {
-    queuedEffects.push(el);
+    queuedEffects.push(el as UnknownComputed);
     return;
   }
 
@@ -364,7 +579,9 @@ function markNode(el: UnknownComputed, newState = CACHE_DIRTY) {
 export function flush(): void {
   for (let i = 0; i < queuedEffects.length; i++) {
     const effect = queuedEffects[i];
-    if (effect.flags & (CACHE_DIRTY | CACHE_CHECK)) recompute(effect);
+    if (effect.flags & (CACHE_DIRTY | CACHE_CHECK)) {
+      updateIfNecessary(effect as UnknownComputed);
+    }
   }
   queuedEffects.length = 0;
 }
@@ -390,7 +607,7 @@ export function onCleanup(fn: Disposable): Disposable {
   return fn;
 }
 
-function runDisposal(node: UnknownComputed): void {
+function runDisposal(node: UnknownComputed | UnknownTask): void {
   if (!node.disposal) return;
 
   if (Array.isArray(node.disposal)) {
@@ -405,7 +622,7 @@ function runDisposal(node: UnknownComputed): void {
   node.disposal = null;
 }
 
-export function getContext(): UnknownComputed | null {
+export function getContext(): UnknownComputed | UnknownTask | null {
   return context;
 }
 
@@ -425,7 +642,6 @@ export function effectScope(fn: () => void): Disposable {
   const owner: Computed<void> = {
     fn: () => {},
     value: undefined,
-    height: 0,
     child: null,
     deps: null,
     depsTail: null,
@@ -475,7 +691,6 @@ export function createEffect(fn: () => void): Disposable {
     disposal: null,
     fn: fn,
     value: undefined,
-    height: 0,
     child: null,
     deps: null,
     depsTail: null,
@@ -485,12 +700,9 @@ export function createEffect(fn: () => void): Disposable {
     equals: null,
   };
 
-  if (context) {
-    effect.height = context.height + 1;
-    link(effect, context);
-  }
+  if (context) link(effect as UnknownComputed, context);
 
-  read(effect); // Initial run
+  updateIfNecessary(effect as UnknownComputed); // Initial run
 
   const dispose = () => {
     unwatched(effect);
