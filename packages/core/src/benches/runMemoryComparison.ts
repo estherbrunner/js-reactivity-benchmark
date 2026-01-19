@@ -1,5 +1,5 @@
 import { cfxFramework } from "../frameworks/cfx";
-import { pushPullR3Framework } from "../frameworks/pushPullR3";
+import { cfxR3Framework } from "../frameworks/cfxR3";
 import { r3Framework } from "../frameworks/r3";
 import { reactivelyFramework } from "../frameworks/reactively";
 import { benchmarkWithMemory } from "../util/benchRepeat";
@@ -9,7 +9,7 @@ import { makeGraph, runGraph } from "./reactively/dependencyGraph";
 const frameworks = [
   { framework: cfxFramework, testPullCounts: true },
   { framework: reactivelyFramework, testPullCounts: true },
-  { framework: pushPullR3Framework, testPullCounts: true },
+  { framework: cfxR3Framework, testPullCounts: true },
   { framework: r3Framework, testPullCounts: false },
 ];
 
