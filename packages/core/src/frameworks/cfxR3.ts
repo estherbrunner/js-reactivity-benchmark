@@ -146,7 +146,7 @@ export function createMemo<T>(
     subsTail: null,
     flags: CACHE_DIRTY,
     equals: options?.equals || ((a: unknown, b: unknown) => a === b),
-  } as Computed<T>;
+  };
 }
 
 /**
@@ -414,11 +414,8 @@ function updateIfNecessary(el: UnknownComputed | UnknownTask): void {
   // Only recompute if we're actually Dirty (not just Check)
   if (el.flags & CACHE_DIRTY) {
     // Check if this is a Task
-    if ("state" in el) {
-      recomputeTask(el as UnknownTask);
-    } else {
-      recompute(el as UnknownComputed);
-    }
+    if ("state" in el) recomputeTask(el as UnknownTask);
+    else recompute(el as UnknownComputed);
   }
 
   // Clear flags after checking/recomputing
@@ -518,15 +515,12 @@ export function read<T>(
   el: Signal<NonNullable<T>> | Computed<T> | Task<T & {}>,
 ): T {
   // Update computed if dirty (pull-based)
-  const owner = ("owner" in el ? el.owner : el) as
-    | UnknownComputed
-    | UnknownTask;
+  const owner = "owner" in el ? el.owner : el;
   if ("fn" in owner && owner.flags & (CACHE_DIRTY | CACHE_CHECK))
     updateIfNecessary(owner);
 
   // Link to current reactive context for dependency tracking
-  if (context)
-    link(el as UnknownSignal | UnknownComputed | UnknownTask, context);
+  if (context) link(el, context);
 
   // Rethrow error if task failed (colorless error propagation)
   if ("error" in el && el.error) throw el.error;
@@ -579,9 +573,8 @@ function markNode(el: UnknownComputed | UnknownTask, newState = CACHE_DIRTY) {
 export function flush(): void {
   for (let i = 0; i < queuedEffects.length; i++) {
     const effect = queuedEffects[i];
-    if (effect.flags & (CACHE_DIRTY | CACHE_CHECK)) {
+    if (effect.flags & (CACHE_DIRTY | CACHE_CHECK))
       updateIfNecessary(effect as UnknownComputed);
-    }
   }
   queuedEffects.length = 0;
 }
