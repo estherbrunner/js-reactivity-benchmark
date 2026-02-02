@@ -1,25 +1,44 @@
 import type { ReactiveFramework } from "../util/reactiveFramework";
 
-export type Disposable = () => void;
+export type Cleanup = () => void;
+export type Guard<T extends {}> = (value: unknown) => value is T;
 
-type UnknownSignal = Signal<unknown & {}>;
-type UnknownComputed = Computed<unknown>;
-type UnknownFirewallSignal = FirewallSignal<unknown>;
-
-// Type constraint: signal values must be non-nullable
-export type Guard<T> = (value: unknown) => value is T;
-
-export type SignalOptions<T extends {}> = {
-  guard?: Guard<T>;
-  equals?: (a: unknown, b: unknown) => boolean;
-  firewall?: UnknownComputed;
+export type State<T extends {}> = {
+  get(): T;
+  set(value: T): void;
 };
 
+export type Memo<T extends {}> = {
+  get(): T;
+};
+
+export type Task<T extends {}> = {
+  get(): T;
+  isPending(): boolean;
+  abort(): void;
+  dispose(): void;
+};
+
+type UnknownState = ProducerNode<unknown & {}>;
+type UnknownChild = ChildNode<unknown & {}>;
+type UnknownMemo = MemoNode<unknown & {}>;
+type UnknownTask = TaskNode<unknown & {}>;
+
+type ProducerNode<T extends {}> = StateNode<T> | ChildNode<T>;
+type ConsumerNode = UnknownMemo | UnknownTask | EffectNode;
+
+export type MemoCallback<T extends {}> = (prev: T) => T;
+export type TaskCallback<T extends {}> = (
+  prev: T,
+  abort: AbortSignal,
+) => Promise<T>;
+export type EffectCallback = () => void;
+
 type CacheFlag =
-  | typeof CACHE_CLEAN
-  | typeof CACHE_CHECK
-  | typeof CACHE_DIRTY
-  | typeof CACHE_RECOMPUTING;
+  | typeof FLAG_CLEAN
+  | typeof FLAG_CHECK
+  | typeof FLAG_DIRTY
+  | typeof FLAG_RUNNING;
 
 type TaskState =
   | typeof TASK_IDLE
@@ -27,20 +46,15 @@ type TaskState =
   | typeof TASK_ABORTED
   | typeof TASK_ERROR;
 
-type TaskCallback<T extends {}> = (
-  oldValue: T,
-  abort: AbortSignal,
-) => Promise<T>;
-
-export interface Link {
-  dep: UnknownSignal | UnknownComputed | UnknownTask;
-  sub: UnknownComputed | UnknownTask;
+interface Link {
+  dep: UnknownState | ConsumerNode;
+  sub: ConsumerNode;
   nextDep: Link | null;
   prevSub: Link | null;
   nextSub: Link | null;
 }
 
-export interface RawSignal<T> {
+interface StateNode<T extends {}> {
   subs: Link | null;
   subsTail: Link | null;
   value: T;
@@ -48,42 +62,55 @@ export interface RawSignal<T> {
   guard?: Guard<T>;
 }
 
-interface FirewallSignal<T> extends RawSignal<T> {
-  owner: UnknownComputed;
-  nextChild: UnknownFirewallSignal | null;
+interface ChildNode<T extends {}> extends StateNode<T> {
+  owner: ConsumerNode;
+  nextChild: UnknownChild | null;
 }
 
-export type Signal<T extends {}> = RawSignal<T> | FirewallSignal<T>;
-
-export interface Computed<T> extends RawSignal<T> {
+interface MemoNode<T extends {}> extends StateNode<T> {
   deps: Link | null;
   depsTail: Link | null;
   flags: CacheFlag;
-  disposal: Disposable | Disposable[] | null;
-  fn: () => T;
-  child: UnknownFirewallSignal | null;
+  cleanup: Cleanup | Cleanup[] | null;
+  fn: MemoCallback<T>;
+  child: UnknownChild | null;
 }
 
-export interface Task<T extends {}> extends RawSignal<T> {
+interface TaskNode<T extends {}> extends StateNode<T> {
   deps: Link | null;
   depsTail: Link | null;
   flags: CacheFlag;
-  disposal: Disposable | Disposable[] | null;
+  cleanup: Cleanup | Cleanup[] | null;
   fn: TaskCallback<T>;
-  child: UnknownFirewallSignal | null;
+  child: UnknownChild | null;
   state: TaskState;
   controller: AbortController | undefined;
   error: Error | undefined;
 }
 
-type UnknownTask = Task<unknown & {}>;
+interface EffectNode {
+  deps: Link | null;
+  depsTail: Link | null;
+  subs: Link | null;
+  subsTail: Link | null;
+  flags: CacheFlag;
+  cleanup: Cleanup | Cleanup[] | null;
+  fn: EffectCallback;
+  child: UnknownChild | null;
+}
+
+export type SignalOptions<T extends {}> = {
+  guard?: Guard<T>;
+  equals?: (a: unknown, b: unknown) => boolean;
+  owner?: ConsumerNode;
+};
 
 /* === Constants === */
 
-const CACHE_CLEAN = 0; // Signal value is valid, no need to recompute
-const CACHE_CHECK = 1 << 0; // Signal value might be stale, check parent nodes to decide whether to recompute
-const CACHE_DIRTY = 1 << 1; // Signal value is invalid, parents have changed, value needs to be recomputed
-const CACHE_RECOMPUTING = 1 << 2; // Signal value is being recomputed
+const FLAG_CLEAN = 0; // Signal value is valid, no need to recompute
+const FLAG_CHECK = 1 << 0; // Signal value might be stale, check parent nodes to decide whether to recompute
+const FLAG_DIRTY = 1 << 1; // Signal value is invalid, parents have changed, value needs to be recomputed
+const FLAG_RUNNING = 1 << 2; // Signal value is being recomputed
 
 const TASK_IDLE = 0;
 const TASK_PENDING = 1;
@@ -92,8 +119,8 @@ const TASK_ERROR = 3;
 
 /* === Internals === */
 
-let context: UnknownComputed | UnknownTask | null = null;
-const queuedEffects: UnknownComputed[] = [];
+let context: ConsumerNode | null = null;
+const queuedEffects: EffectNode[] = [];
 let batchDepth = 0;
 
 /* === Errors === */
@@ -122,7 +149,7 @@ const valueString = (value: unknown): string =>
       ? JSON.stringify(value)
       : String(value);
 
-const validateSignalValue = <T>(
+const validateSignalValue = <T extends {}>(
   where: string,
   value: unknown,
   guard?: Guard<T>,
@@ -131,77 +158,77 @@ const validateSignalValue = <T>(
   if (guard && !guard(value)) throw new InvalidSignalValueError(where, value);
 };
 
-export function createMemo<T>(
-  fn: () => T,
-  options?: SignalOptions<NonNullable<T>>,
-): Computed<T> {
-  return {
-    disposal: null,
-    fn: fn,
+export function createMemo<T extends {}>(
+  fn: MemoCallback<T>,
+  options?: SignalOptions<T>,
+): Memo<T> {
+  const memo = {
+    cleanup: null,
+    fn,
     value: undefined as unknown as T,
     child: null,
     deps: null,
     depsTail: null,
     subs: null,
     subsTail: null,
-    flags: CACHE_DIRTY,
-    equals: options?.equals || ((a: unknown, b: unknown) => a === b),
+    flags: FLAG_DIRTY,
+    equals: options?.equals ?? ((a, b) => a === b),
+  };
+
+  return {
+    get(): T {
+      return read(memo);
+    },
   };
 }
 
 /**
  * Create an async computed signal (Task) that awaits promises.
- *
- * Features:
- * - Automatically tracks dependencies like computed signals
- * - Provides AbortSignal to cancel in-flight work when dependencies change
- * - Catches errors and rethrows them on read() (colorless error propagation)
- * - Returns last committed value while pending
- *
- * @example
- * const userId = createState(1);
- * const userData = createTask(async (prev, signal) => {
- *   const id = read(userId);
- *   const response = await fetch(`/api/users/${id}`, { signal });
- *   return response.json();
- * }, initialUserData);
  */
 export function createTask<T extends {}>(
   fn: TaskCallback<T>,
   initialValue: T,
-  options?: SignalOptions<NonNullable<T>>,
+  options?: SignalOptions<T>,
 ): Task<T> {
   validateSignalValue("Task", initialValue, options?.guard);
 
-  return {
-    disposal: null,
-    fn: fn,
+  const task: TaskNode<T> = {
+    cleanup: null,
+    fn,
     value: initialValue,
     child: null,
     deps: null,
     depsTail: null,
     subs: null,
     subsTail: null,
-    flags: CACHE_DIRTY,
+    flags: FLAG_DIRTY,
     equals: options?.equals || ((a: unknown, b: unknown) => a === b),
     guard: options?.guard,
     state: TASK_IDLE,
     controller: undefined,
     error: undefined,
   };
-}
 
-/**
- * Check if a task is currently pending (executing async work).
- */
-export function isPending<T extends {}>(task: Task<T>): boolean {
-  return task.state === TASK_PENDING;
+  return {
+    get(): T {
+      return read(task);
+    },
+    isPending(): boolean {
+      return task.state === TASK_PENDING;
+    },
+    abort(): void {
+      abortTask(task);
+    },
+    dispose(): void {
+      disposeTask(task);
+    },
+  };
 }
 
 /**
  * Abort a task's in-flight execution.
  */
-export function abortTask<T extends {}>(task: Task<T>): void {
+function abortTask<T extends {}>(task: TaskNode<T>): void {
   task.controller?.abort();
   task.controller = undefined;
   if (task.state === TASK_PENDING) task.state = TASK_ABORTED;
@@ -210,16 +237,16 @@ export function abortTask<T extends {}>(task: Task<T>): void {
 /**
  * Dispose a task, aborting in-flight work and unlinking from the reactive graph.
  */
-export function disposeTask<T extends {}>(task: Task<T>): void {
+function disposeTask<T extends {}>(task: TaskNode<T>): void {
   abortTask(task);
 
   // Unlink from dependencies
   let dep = task.deps;
-  while (dep !== null) dep = unlinkSubs(dep);
+  while (dep) dep = unlinkSubs(dep);
   task.deps = null;
 
   // Run disposal callbacks
-  runDisposal(task as unknown as UnknownTask);
+  runCleanup(task as unknown as UnknownTask);
 
   // Clear subscribers
   task.subs = null;
@@ -231,50 +258,61 @@ export function disposeTask<T extends {}>(task: Task<T>): void {
 }
 
 export function createState<T extends {}>(
-  v: T,
+  value: T,
   options?: SignalOptions<T>,
-): Signal<T> {
-  validateSignalValue("State", v, options?.guard);
+): State<T> {
+  validateSignalValue("State", value, options?.guard);
 
-  const firewall = options?.firewall;
+  const owner = options?.owner;
 
-  if (firewall) {
-    firewall.child = {
-      value: v,
-      subs: null,
-      subsTail: null,
-      owner: firewall,
-      nextChild: firewall.child,
-      equals: options?.equals ?? ((a, b) => a === b),
-      guard: options?.guard,
-    };
-    return firewall.child as unknown as Signal<T>;
-  } else {
-    return {
-      value: v,
-      subs: null,
-      subsTail: null,
-      equals: options?.equals ?? ((a, b) => a === b),
-      guard: options?.guard,
-    };
+  const state: ProducerNode<T> = {
+    value,
+    subs: null,
+    subsTail: null,
+    equals: options?.equals ?? ((a, b) => a === b),
+    guard: options?.guard,
+  } as StateNode<T>;
+
+  if (owner) {
+    (state as ChildNode<T>).owner = owner;
+    (state as ChildNode<T>).nextChild = state as unknown as UnknownChild;
+    owner.child = state as ChildNode<T>;
   }
+
+  return {
+    get(): T {
+      if (context) linkSub(state, context);
+      return state.value;
+    },
+    set(next: T): void {
+      if (next == null) throw new NullishSignalValueError("State");
+      if (state.guard && !state.guard(next))
+        throw new InvalidSignalValueError("State", next);
+
+      if (state.equals?.(next, state.value)) return;
+      state.value = next;
+
+      for (let link = state.subs; link; link = link.nextSub) markNode(link.sub);
+      if (!batchDepth) flush();
+    },
+  };
 }
 
-function recompute(el: UnknownComputed) {
-  runDisposal(el);
-  const oldcontext = context;
+function recomputeMemo(el: UnknownMemo) {
+  runCleanup(el);
+  const prevContext = context;
   context = el;
   el.depsTail = null;
-  el.flags = CACHE_RECOMPUTING;
-  const value = el.fn();
-  context = oldcontext;
+  el.flags = FLAG_RUNNING;
+  const value = el.fn(el.value);
+  context = prevContext;
 
   const depsTail = el.depsTail as Link | null;
-  let toRemove = depsTail !== null ? depsTail.nextDep : el.deps;
+  let toRemove = depsTail ? depsTail.nextDep : el.deps;
   if (toRemove) {
     do {
       toRemove = unlinkSubs(toRemove);
-    } while (toRemove !== null);
+    } while (toRemove);
     // biome-ignore lint/suspicious/noAssignInExpressions: micro-optimization
     depsTail ? (depsTail.nextDep = null) : (el.deps = null);
   }
@@ -292,19 +330,19 @@ function recompute(el: UnknownComputed) {
     el.value = value;
 
     // Mark subscribers as dirty/check
-    for (let s = el.subs; s !== null; s = s.nextSub) {
-      const o = s.sub;
+    for (let sub = el.subs; sub; sub = sub.nextSub) {
+      const o = sub.sub;
       const flags = o.flags;
       // If already Check, escalate to Dirty; otherwise mark as Dirty
-      flags & CACHE_CHECK
+      flags & FLAG_CHECK
         ? // biome-ignore lint/suspicious/noAssignInExpressions: micro-optimization
-          (o.flags = flags | CACHE_DIRTY)
-        : markNode(o, CACHE_DIRTY);
+          (o.flags = flags | FLAG_DIRTY)
+        : markNode(o);
     }
   }
 
   // Clear flags after recompute
-  el.flags = CACHE_CLEAN;
+  el.flags = FLAG_CLEAN;
 }
 
 function recomputeTask(el: UnknownTask) {
@@ -321,36 +359,36 @@ function recomputeTask(el: UnknownTask) {
   el.state = TASK_PENDING;
   el.error = undefined;
 
-  runDisposal(el);
-  const oldcontext = context;
+  runCleanup(el);
+  const prevContext = context;
   context = el;
   el.depsTail = null;
-  el.flags = CACHE_RECOMPUTING;
+  el.flags = FLAG_RUNNING;
 
   let promise: Promise<unknown>;
   try {
     promise = el.fn(oldValue, controller.signal);
 
     const depsTail = el.depsTail as Link | null;
-    let toRemove = depsTail !== null ? depsTail.nextDep : el.deps;
+    let toRemove = depsTail ? depsTail.nextDep : el.deps;
     if (toRemove) {
       do {
         toRemove = unlinkSubs(toRemove);
-      } while (toRemove !== null);
+      } while (toRemove);
       // biome-ignore lint/suspicious/noAssignInExpressions: micro-optimization
       depsTail ? (depsTail.nextDep = null) : (el.deps = null);
     }
-  } catch (e) {
+  } catch (err) {
     // Synchronous throw from callback: treat as immediate error, keep old committed value
-    context = oldcontext;
+    context = prevContext;
     el.state = TASK_ERROR;
     el.controller = undefined;
-    el.error = e instanceof Error ? e : new Error(String(e));
-    el.flags = CACHE_CLEAN;
+    el.error = err instanceof Error ? err : new Error(String(err));
+    el.flags = FLAG_CLEAN;
     return;
   }
 
-  context = oldcontext;
+  context = prevContext;
 
   promise.then(
     (next) => {
@@ -365,17 +403,17 @@ function recomputeTask(el: UnknownTask) {
         el.value = next as typeof el.value;
 
         // Mark subscribers as dirty/check
-        for (let s = el.subs; s !== null; s = s.nextSub) {
-          const o = s.sub;
+        for (let sub = el.subs; sub; sub = sub.nextSub) {
+          const o = sub.sub;
           const flags = o.flags;
-          flags & CACHE_CHECK
+          flags & FLAG_CHECK
             ? // biome-ignore lint/suspicious/noAssignInExpressions: micro-optimization
-              (o.flags = flags | CACHE_DIRTY)
-            : markNode(o, CACHE_DIRTY);
+              (o.flags = flags | FLAG_DIRTY)
+            : markNode(o, FLAG_DIRTY);
         }
       }
 
-      el.flags = CACHE_CLEAN;
+      el.flags = FLAG_CLEAN;
     },
     (err: unknown) => {
       if (controller.signal.aborted) return;
@@ -386,40 +424,63 @@ function recomputeTask(el: UnknownTask) {
       el.error = err instanceof Error ? err : new Error(String(err));
 
       // Notify dependents so they can react/throw if they read
-      for (let s = el.subs; s !== null; s = s.nextSub) {
-        const o = s.sub;
+      for (let sub = el.subs; sub; sub = sub.nextSub) {
+        const o = sub.sub;
         const flags = o.flags;
-        flags & CACHE_CHECK
+        flags & FLAG_CHECK
           ? // biome-ignore lint/suspicious/noAssignInExpressions: micro-optimization
-            (o.flags = flags | CACHE_DIRTY)
-          : markNode(o, CACHE_CHECK);
+            (o.flags = flags | FLAG_DIRTY)
+          : markNode(o, FLAG_CHECK);
       }
 
-      el.flags = CACHE_CLEAN;
+      el.flags = FLAG_CLEAN;
     },
   );
 }
 
-function updateIfNecessary(el: UnknownComputed | UnknownTask): void {
+function runEffect(el: EffectNode) {
+  runCleanup(el);
+  const prevContext = context;
+  context = el;
+  el.depsTail = null;
+  el.flags = FLAG_RUNNING;
+  el.fn();
+  context = prevContext;
+
+  const depsTail = el.depsTail as Link | null;
+  let toRemove = depsTail ? depsTail.nextDep : el.deps;
+  if (toRemove) {
+    do {
+      toRemove = unlinkSubs(toRemove);
+    } while (toRemove);
+    // biome-ignore lint/suspicious/noAssignInExpressions: micro-optimization
+    depsTail ? (depsTail.nextDep = null) : (el.deps = null);
+  }
+
+  // Clear flags after recompute
+  el.flags = FLAG_CLEAN;
+}
+
+function updateIfNecessary(el: ConsumerNode): void {
   // If marked Check, recursively update dependencies to see if we're actually dirty
-  if (el.flags & CACHE_CHECK) {
-    for (let d = el.deps; d !== null; d = d.nextDep) {
-      "fn" in d.dep &&
-        updateIfNecessary(d.dep as UnknownComputed | UnknownTask);
+  if (el.flags & FLAG_CHECK) {
+    for (let dep = el.deps; dep; dep = dep.nextDep) {
+      "fn" in dep.dep && updateIfNecessary(dep.dep);
       // Early exit if dependency recomputation escalated us to Dirty
-      if (el.flags & CACHE_DIRTY) break;
+      if (el.flags & FLAG_DIRTY) break;
     }
   }
 
   // Only recompute if we're actually Dirty (not just Check)
-  if (el.flags & CACHE_DIRTY) {
+  if (el.flags & FLAG_DIRTY) {
     // Check if this is a Task
-    if ("state" in el) recomputeTask(el as UnknownTask);
-    else recompute(el as UnknownComputed);
+    if ("state" in el) recomputeTask(el);
+    else if ("value" in el) recomputeMemo(el);
+    else runEffect(el);
   }
 
   // Clear flags after checking/recomputing
-  el.flags = CACHE_CLEAN;
+  el.flags = FLAG_CLEAN;
 }
 
 // https://github.com/stackblitz/alien-signals/blob/v2.0.3/src/system.ts#L100
@@ -430,48 +491,41 @@ function unlinkSubs(link: Link): Link | null {
   const prevSub = link.prevSub;
 
   // biome-ignore lint/suspicious/noAssignInExpressions: micro-optimization
-  nextSub !== null ? (nextSub.prevSub = prevSub) : (dep.subsTail = prevSub);
+  nextSub ? (nextSub.prevSub = prevSub) : (dep.subsTail = prevSub);
 
-  prevSub !== null
+  prevSub
     ? // biome-ignore lint/suspicious/noAssignInExpressions: micro-optimization
       (prevSub.nextSub = nextSub)
     : // biome-ignore lint/suspicious/noAssignInExpressions: micro-optimization
       // biome-ignore lint/complexity/noCommaOperator: micro-optimization
-      ((dep.subs = nextSub), nextSub === null && "fn" in dep && unwatched(dep));
+      ((dep.subs = nextSub), !nextSub && "fn" in dep && unwatched(dep));
 
   return nextDep;
 }
 
-function unwatched(el: UnknownComputed | UnknownTask) {
+function unwatched(el: ConsumerNode) {
   let dep = el.deps;
-  while (dep !== null) dep = unlinkSubs(dep);
+  while (dep) dep = unlinkSubs(dep);
   el.deps = null;
-  runDisposal(el);
+  runCleanup(el);
 }
 
 // https://github.com/stackblitz/alien-signals/blob/v2.0.3/src/system.ts#L52
-function link(
-  dep: UnknownSignal | UnknownComputed | UnknownTask,
-  sub: UnknownComputed | UnknownTask,
-) {
+function linkSub(dep: UnknownState | ConsumerNode, sub: ConsumerNode) {
   const prevDep = sub.depsTail;
-  if (prevDep !== null && prevDep.dep === dep) return;
+  if (prevDep?.dep === dep) return;
   let nextDep: Link | null = null;
-  const isRecomputing = sub.flags & CACHE_RECOMPUTING;
+  const isRecomputing = sub.flags & FLAG_RUNNING;
   if (isRecomputing) {
-    nextDep = prevDep !== null ? prevDep.nextDep : sub.deps;
-    if (nextDep !== null && nextDep.dep === dep) {
+    nextDep = prevDep ? prevDep.nextDep : sub.deps;
+    if (nextDep && nextDep.dep === dep) {
       sub.depsTail = nextDep;
       return;
     }
   }
 
   const prevSub = dep.subsTail;
-  if (
-    prevSub !== null &&
-    prevSub.sub === sub &&
-    (!isRecomputing || isValidLink(prevSub, sub))
-  )
+  if (prevSub?.sub === sub && (!isRecomputing || isValidLink(prevSub, sub)))
     return;
   const newLink =
     // biome-ignore lint/suspicious/noAssignInExpressions: micro-optimization
@@ -487,18 +541,15 @@ function link(
       });
 
   // biome-ignore lint/suspicious/noAssignInExpressions: micro-optimization
-  prevDep !== null ? (prevDep.nextDep = newLink) : (sub.deps = newLink);
+  prevDep ? (prevDep.nextDep = newLink) : (sub.deps = newLink);
   // biome-ignore lint/suspicious/noAssignInExpressions: micro-optimization
-  prevSub !== null ? (prevSub.nextSub = newLink) : (dep.subs = newLink);
+  prevSub ? (prevSub.nextSub = newLink) : (dep.subs = newLink);
 }
 
 // https://github.com/stackblitz/alien-signals/blob/v2.0.3/src/system.ts#L284
-function isValidLink(
-  checkLink: Link,
-  sub: UnknownComputed | UnknownTask,
-): boolean {
+function isValidLink(checkLink: Link, sub: ConsumerNode): boolean {
   const depsTail = sub.depsTail;
-  if (depsTail !== null) {
+  if (depsTail) {
     // biome-ignore lint/style/noNonNullAssertion: we know what we're doing
     let link = sub.deps!;
     do {
@@ -506,45 +557,30 @@ function isValidLink(
       if (link === depsTail) break;
       // biome-ignore lint/style/noNonNullAssertion: we know what we're doing
       link = link.nextDep!;
-    } while (link !== null);
+    } while (link);
   }
   return false;
 }
 
-export function read<T>(
-  el: Signal<NonNullable<T>> | Computed<T> | Task<T & {}>,
-): T {
-  // Update computed if dirty (pull-based)
-  const owner = "owner" in el ? el.owner : el;
-  if ("fn" in owner && owner.flags & (CACHE_DIRTY | CACHE_CHECK))
-    updateIfNecessary(owner);
-
-  // Link to current reactive context for dependency tracking
-  if (context) link(el, context);
-
-  // Rethrow error if task failed (colorless error propagation)
+function read<T extends {}>(el: MemoNode<T> | TaskNode<T>): T {
+  if (el.flags & (FLAG_DIRTY | FLAG_CHECK))
+    updateIfNecessary(el as unknown as ConsumerNode);
+  if (context) linkSub(el, context);
   if ("error" in el && el.error) throw el.error;
-
   return el.value;
 }
 
-export function setSignal<T extends unknown & {}>(el: Signal<T>, v: T) {
-  validateSignalValue("setSignal", v, el.guard);
-
-  if (el.equals?.(v, el.value)) return;
-  el.value = v;
-
-  for (let link = el.subs; link !== null; link = link.nextSub)
-    markNode(link.sub, CACHE_DIRTY);
-
-  if (batchDepth === 0) flush();
-}
-
-function markNode(el: UnknownComputed | UnknownTask, newState = CACHE_DIRTY) {
+function markNode(el: ConsumerNode, newState = FLAG_DIRTY) {
   const flags = el.flags;
-  if ((flags & (CACHE_DIRTY | CACHE_CHECK)) >= newState) return;
+  if ((flags & (FLAG_DIRTY | FLAG_CHECK)) >= newState) return;
 
   el.flags = flags | newState;
+
+  // Effects have no value field - collect them for later execution
+  if (!("value" in el) && !(flags & (FLAG_DIRTY | FLAG_CHECK))) {
+    queuedEffects.push(el);
+    return;
+  }
 
   // Special handling for tasks: abort in-flight work when dependencies change
   if ("state" in el && el.state === TASK_PENDING) {
@@ -553,28 +589,21 @@ function markNode(el: UnknownComputed | UnknownTask, newState = CACHE_DIRTY) {
     el.state = TASK_ABORTED;
   }
 
-  // Effects have equals === null - collect them for later execution
-  if (el.equals === null && !(flags & (CACHE_DIRTY | CACHE_CHECK))) {
-    queuedEffects.push(el as UnknownComputed);
-    return;
-  }
-
   // Propagate Check to subscribers
-  for (let link = el.subs; link !== null; link = link.nextSub)
-    markNode(link.sub, CACHE_CHECK);
+  for (let link = el.subs; link; link = link.nextSub)
+    markNode(link.sub, FLAG_CHECK);
 
   // Propagate to firewall children
-  for (let child = el.child; child !== null; child = child.nextChild) {
-    for (let link = child.subs; link !== null; link = link.nextSub)
-      markNode(link.sub, CACHE_CHECK);
+  for (let child = el.child; child; child = child.nextChild) {
+    for (let link = child.subs; link; link = link.nextSub)
+      markNode(link.sub, FLAG_CHECK);
   }
 }
 
-export function flush(): void {
+function flush(): void {
   for (let i = 0; i < queuedEffects.length; i++) {
     const effect = queuedEffects[i];
-    if (effect.flags & (CACHE_DIRTY | CACHE_CHECK))
-      updateIfNecessary(effect as UnknownComputed);
+    if (effect.flags & (FLAG_DIRTY | FLAG_CHECK)) updateIfNecessary(effect);
   }
   queuedEffects.length = 0;
 }
@@ -589,34 +618,25 @@ export function batch(fn: () => void): void {
   }
 }
 
-export function onCleanup(fn: Disposable): Disposable {
+export function onCleanup(fn: Cleanup): Cleanup {
   if (!context) return fn;
 
   const node = context;
 
-  if (!node.disposal) node.disposal = fn;
-  else if (Array.isArray(node.disposal)) node.disposal.push(fn);
-  else node.disposal = [node.disposal, fn];
+  if (!node.cleanup) node.cleanup = fn;
+  else if (Array.isArray(node.cleanup)) node.cleanup.push(fn);
+  else node.cleanup = [node.cleanup, fn];
   return fn;
 }
 
-function runDisposal(node: UnknownComputed | UnknownTask): void {
-  if (!node.disposal) return;
+function runCleanup(node: UnknownMemo | UnknownTask | EffectNode): void {
+  if (!node.cleanup) return;
 
-  if (Array.isArray(node.disposal)) {
-    for (let i = 0; i < node.disposal.length; i++) {
-      const callable = node.disposal[i];
-      callable.call(callable);
-    }
-  } else {
-    node.disposal.call(node.disposal);
-  }
+  if (Array.isArray(node.cleanup))
+    for (let i = 0; i < node.cleanup.length; i++) node.cleanup[i]();
+  else node.cleanup();
 
-  node.disposal = null;
-}
-
-export function getContext(): UnknownComputed | UnknownTask | null {
-  return context;
+  node.cleanup = null;
 }
 
 /**
@@ -630,20 +650,17 @@ export function getContext(): UnknownComputed | UnknownTask | null {
  * });
  * // Later: dispose() cleans up both effects
  */
-export function effectScope(fn: () => void): Disposable {
-  // Create a dummy computed to act as owner
-  const owner: Computed<void> = {
+export function effectScope(fn: () => void): Cleanup {
+  // Create an effect node to act as owner
+  const owner: EffectNode = {
     fn: () => {},
-    value: undefined,
     child: null,
     deps: null,
     depsTail: null,
     subs: null,
     subsTail: null,
-    flags: CACHE_DIRTY,
-    disposal: null,
-    equals: null,
-    guard: undefined,
+    flags: FLAG_DIRTY,
+    cleanup: null,
   };
 
   // Run function with owner as active context
@@ -659,11 +676,11 @@ export function effectScope(fn: () => void): Disposable {
   return () => {
     // Clean up all children (firewall signals)
     let child = owner.child;
-    while (child !== null) {
+    while (child) {
       const next = child.nextChild;
       // Unlink all subscribers of this child signal
       let link = child.subs;
-      while (link !== null) {
+      while (link) {
         link = unlinkSubs(link);
       }
       child = next;
@@ -671,7 +688,7 @@ export function effectScope(fn: () => void): Disposable {
     owner.child = null;
 
     // Run disposal callbacks (effects registered via onCleanup)
-    runDisposal(owner);
+    runCleanup(owner);
   };
 }
 
@@ -679,32 +696,28 @@ export function effectScope(fn: () => void): Disposable {
  * Create an effect that runs immediately and re-runs when dependencies change.
  * Returns a disposer function.
  */
-export function createEffect(fn: () => void): Disposable {
-  const effect: Computed<void> = {
-    disposal: null,
-    fn: fn,
-    value: undefined,
+export function createEffect(fn: EffectCallback): Cleanup {
+  const effect: EffectNode = {
+    cleanup: null,
+    fn,
     child: null,
     deps: null,
     depsTail: null,
     subs: null,
     subsTail: null,
-    flags: CACHE_DIRTY,
-    equals: null,
+    flags: FLAG_DIRTY,
   };
 
-  if (context) link(effect as UnknownComputed, context);
+  updateIfNecessary(effect); // Initial run
 
-  updateIfNecessary(effect as UnknownComputed); // Initial run
-
-  const dispose = () => {
+  const cleanup = () => {
     unwatched(effect);
   };
 
   // Register with active owner if present
-  if (context) onCleanup(dispose);
+  if (context) onCleanup(cleanup);
 
-  return dispose;
+  return cleanup;
 }
 
 /* === Test Framework === */
@@ -715,24 +728,20 @@ export const cfxR3Framework: ReactiveFramework = {
   name: "cfxR3",
   // @ts-expect-error ReactiveFramework doesn't have non-nullable signals
   signal: <T extends {}>(initialValue: T) => {
-    const s = createState(initialValue);
+    const state = createState(initialValue);
     return {
-      // biome-ignore lint/suspicious/noExplicitAny: we suport updater functions in .set()
-      write: (v) => setSignal(s, v as any),
-      read: () => read(s),
+      write: state.set,
+      read: state.get,
     };
   },
   // @ts-expect-error ReactiveFramework doesn't have non-nullable signals
   computed: <T extends {}>(fn: () => T) => {
-    const c = createMemo(fn);
+    const memo = createMemo(fn);
     return {
-      read: () => read(c),
+      read: memo.get,
     };
   },
-  effect: (fn) => {
-    const dispose = createEffect(fn);
-    cleanups.add(dispose);
-  },
+  effect: createEffect,
   withBatch: (fn) => batch(fn),
   withBuild: <T>(fn: () => T) => {
     let out!: T;

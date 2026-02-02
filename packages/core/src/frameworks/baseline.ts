@@ -66,7 +66,7 @@ const isValidLink = (checkLink: Link, sub: Computation<unknown>): boolean => {
   return false;
 };
 
-const unlinkDepFromTarget = (target: Computation<unknown>, link: Link) => {
+const unlinkDep = (target: Computation<unknown>, link: Link) => {
   let prev: Link | null = null;
   let cur = target.depsHead;
   while (cur) {
@@ -82,7 +82,7 @@ const unlinkDepFromTarget = (target: Computation<unknown>, link: Link) => {
   link.nextDep = null;
 };
 
-const link = (source: SourceNode, sub: Computation<unknown>) => {
+const linkSub = (source: SourceNode, sub: Computation<unknown>) => {
   const prevDep = sub.depsTail;
   if (prevDep && prevDep.source === source) return;
 
@@ -157,12 +157,6 @@ const invalidateSource = (source: SourceNode) => {
     markNode(link.target, FLAG_DIRTY);
     link = link.nextSub;
   }
-};
-
-const trackDependency = (source: SourceNode) => {
-  const comp = current;
-  if (!comp) return;
-  link(source, comp);
 };
 
 const runComputed = <T>(comp: Computation<T>) => {
@@ -240,7 +234,7 @@ const disposeComputation = (comp: Computation<unknown>) => {
   link = comp.subsHead;
   while (link) {
     const next = link.nextSub;
-    unlinkDepFromTarget(link.target, link);
+    unlinkDep(link.target, link);
     unlinkSub(comp, link);
     link = next;
   }
@@ -255,7 +249,7 @@ const createSignal = <T>(value: T): [() => T, (next: T) => void] => {
     subsTail: null,
   };
   const get = (): T => {
-    if (current) trackDependency(node);
+    if (current) linkSub(node, current);
     return node.value;
   };
   const set = (next: T) => {
@@ -281,7 +275,7 @@ const createComputed = <T>(fn: () => T) => {
   if (currentScope) currentScope.comps.push(comp);
   return () => {
     ensureFresh(comp);
-    if (current) trackDependency(comp);
+    if (current) linkSub(comp, current);
     return comp.value as T;
   };
 };

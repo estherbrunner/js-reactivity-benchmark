@@ -7,7 +7,7 @@ import {
   disposeTask,
   isPending,
   read,
-  setSignal,
+  setState,
 } from "./frameworks/cfxR3.js";
 
 // Example 1: Basic async task that fetches data based on a signal
@@ -39,7 +39,7 @@ async function example1() {
   await new Promise((resolve) => setTimeout(resolve, 150));
 
   // Change userId - should abort previous fetch and start new one
-  setSignal(userId, 2);
+  setState(userId, 2);
   await new Promise((resolve) => setTimeout(resolve, 150));
 
   console.log("Final data:", read(userData));
@@ -69,7 +69,7 @@ async function example2() {
 
   // Now make it fail (this marks task dirty and triggers recomputation)
   console.log("\nChanging shouldFail to true...");
-  setSignal(shouldFail, true);
+  setState(shouldFail, true);
 
   // Trigger task by reading (returns old value while pending)
   console.log("Value while pending:", read(task));
@@ -160,11 +160,11 @@ async function example4() {
   await new Promise((resolve) => setTimeout(resolve, 50));
 
   // Change query before first completes - should abort first fetch
-  setSignal(query, "vue");
+  setState(query, "vue");
   await new Promise((resolve) => setTimeout(resolve, 50));
 
   // Change query again - should abort second fetch
-  setSignal(query, "svelte");
+  setState(query, "svelte");
   await new Promise((resolve) => setTimeout(resolve, 200));
 
   console.log("Final:", read(searchResults));
@@ -191,8 +191,8 @@ async function example5() {
 
   // Without batch - would trigger task twice
   console.log("\nWithout batch:");
-  setSignal(a, 5);
-  setSignal(b, 10);
+  setState(a, 5);
+  setState(b, 10);
   await new Promise((resolve) => setTimeout(resolve, 100));
   console.log("Result:", read(sum), "Task ran", taskRunCount, "times");
 
@@ -202,8 +202,8 @@ async function example5() {
   // With batch - should only trigger task once
   console.log("\nWith batch:");
   batch(() => {
-    setSignal(a, 20);
-    setSignal(b, 30);
+    setState(a, 20);
+    setState(b, 30);
   });
   await new Promise((resolve) => setTimeout(resolve, 100));
   console.log("Result:", read(sum), "Task ran", taskRunCount, "times");
