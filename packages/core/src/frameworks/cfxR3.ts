@@ -3,9 +3,74 @@ import type { ReactiveFramework } from "../util/reactiveFramework";
 export type Cleanup = () => void;
 export type Guard<T extends {}> = (value: unknown) => value is T;
 
+type Link = {
+  dep: StateNode<unknown & {}> | ConsumerNode;
+  sub: ConsumerNode;
+  nextDep: Link | null;
+  prevSub: Link | null;
+  nextSub: Link | null;
+};
+
+type StateNode<T extends {}> = {
+  value: T;
+  subs: Link | null;
+  subsTail: Link | null;
+  equals: (a: unknown, b: unknown) => boolean;
+  guard: Guard<T> | undefined;
+};
+
+type ConsumerNode =
+  | MemoNode<unknown & {}>
+  | TaskNode<unknown & {}>
+  | EffectNode;
+
+type MemoNode<T extends {}> = {
+  fn: (prev: T) => T;
+  value: T;
+  flags: number;
+  deps: Link | null;
+  depsTail: Link | null;
+  subs: Link | null;
+  subsTail: Link | null;
+  cleanup: Cleanup | Cleanup[] | null;
+  equals: (a: unknown, b: unknown) => boolean;
+  guard: Guard<T> | undefined;
+};
+
+type TaskNode<T extends {}> = {
+  fn: (prev: T, abort: AbortSignal) => Promise<T>;
+  value: T;
+  flags: number;
+  deps: Link | null;
+  depsTail: Link | null;
+  subs: Link | null;
+  subsTail: Link | null;
+  cleanup: Cleanup | Cleanup[] | null;
+  equals: (a: unknown, b: unknown) => boolean;
+  guard: Guard<T> | undefined;
+  state: number;
+  controller: AbortController | undefined;
+  error: Error | undefined;
+};
+
+type EffectNode = {
+  fn: () => void;
+  flags: number;
+  deps: Link | null;
+  depsTail: Link | null;
+  subs: Link | null;
+  subsTail: Link | null;
+  cleanup: Cleanup | Cleanup[] | null;
+};
+
+type Scope = {
+  nodes: ConsumerNode[];
+  cleanups: Cleanup[];
+};
+
 export type State<T extends {}> = {
   get(): T;
-  set(value: T): void;
+  set(next: T): void;
 };
 
 export type Memo<T extends {}> = {
@@ -16,93 +81,19 @@ export type Task<T extends {}> = {
   get(): T;
   isPending(): boolean;
   abort(): void;
-  dispose(): void;
+  disconnect(): void;
 };
-
-type UnknownState = ProducerNode<unknown & {}>;
-type UnknownChild = ChildNode<unknown & {}>;
-type UnknownMemo = MemoNode<unknown & {}>;
-type UnknownTask = TaskNode<unknown & {}>;
-
-type ProducerNode<T extends {}> = StateNode<T> | ChildNode<T>;
-type ConsumerNode = UnknownMemo | UnknownTask | EffectNode;
 
 export type MemoCallback<T extends {}> = (prev: T) => T;
 export type TaskCallback<T extends {}> = (
   prev: T,
-  abort: AbortSignal,
+  signal: AbortSignal,
 ) => Promise<T>;
 export type EffectCallback = () => void;
-
-type CacheFlag =
-  | typeof FLAG_CLEAN
-  | typeof FLAG_CHECK
-  | typeof FLAG_DIRTY
-  | typeof FLAG_RUNNING;
-
-type TaskState =
-  | typeof TASK_IDLE
-  | typeof TASK_PENDING
-  | typeof TASK_ABORTED
-  | typeof TASK_ERROR;
-
-interface Link {
-  dep: UnknownState | ConsumerNode;
-  sub: ConsumerNode;
-  nextDep: Link | null;
-  prevSub: Link | null;
-  nextSub: Link | null;
-}
-
-interface StateNode<T extends {}> {
-  subs: Link | null;
-  subsTail: Link | null;
-  value: T;
-  equals: ((a: unknown, b: unknown) => boolean) | null;
-  guard?: Guard<T>;
-}
-
-interface ChildNode<T extends {}> extends StateNode<T> {
-  owner: ConsumerNode;
-  nextChild: UnknownChild | null;
-}
-
-interface MemoNode<T extends {}> extends StateNode<T> {
-  deps: Link | null;
-  depsTail: Link | null;
-  flags: CacheFlag;
-  cleanup: Cleanup | Cleanup[] | null;
-  fn: MemoCallback<T>;
-  child: UnknownChild | null;
-}
-
-interface TaskNode<T extends {}> extends StateNode<T> {
-  deps: Link | null;
-  depsTail: Link | null;
-  flags: CacheFlag;
-  cleanup: Cleanup | Cleanup[] | null;
-  fn: TaskCallback<T>;
-  child: UnknownChild | null;
-  state: TaskState;
-  controller: AbortController | undefined;
-  error: Error | undefined;
-}
-
-interface EffectNode {
-  deps: Link | null;
-  depsTail: Link | null;
-  subs: Link | null;
-  subsTail: Link | null;
-  flags: CacheFlag;
-  cleanup: Cleanup | Cleanup[] | null;
-  fn: EffectCallback;
-  child: UnknownChild | null;
-}
 
 export type SignalOptions<T extends {}> = {
   guard?: Guard<T>;
   equals?: (a: unknown, b: unknown) => boolean;
-  owner?: ConsumerNode;
 };
 
 /* === Constants === */
@@ -117,30 +108,476 @@ const TASK_PENDING = 1;
 const TASK_ABORTED = 2;
 const TASK_ERROR = 3;
 
-/* === Internals === */
+const DEFAULT_EQUALS = (a: unknown, b: unknown) => a === b;
+
+/* === Module State === */
 
 let context: ConsumerNode | null = null;
+let currentScope: Scope | null = null;
+let rootScope: Scope | null = null;
 const queuedEffects: EffectNode[] = [];
 let batchDepth = 0;
 
+/* === Link Management === */
+
+const unlinkSub = (link: Link) => {
+  const dep = link.dep;
+  const nextDep = link.nextDep;
+  const nextSub = link.nextSub;
+  const prevSub = link.prevSub;
+
+  // biome-ignore lint/suspicious/noAssignInExpressions: micro-optimization
+  nextSub !== null ? (nextSub.prevSub = prevSub) : (dep.subsTail = prevSub);
+
+  prevSub !== null
+    ? // biome-ignore lint/suspicious/noAssignInExpressions: micro-optimization
+      (prevSub.nextSub = nextSub)
+    : // biome-ignore lint/suspicious/noAssignInExpressions: micro-optimization
+      (dep.subs = nextSub);
+
+  return nextDep;
+};
+
+const isValidLink = (checkLink: Link, sub: ConsumerNode): boolean => {
+  const depsTail = sub.depsTail;
+  if (depsTail) {
+    let link = sub.deps;
+    while (link) {
+      if (link === checkLink) return true;
+      if (link === depsTail) break;
+      link = link.nextDep;
+    }
+  }
+  return false;
+};
+
+const linkSub = (
+  dep: StateNode<unknown & {}> | ConsumerNode,
+  sub: ConsumerNode,
+) => {
+  const prevDep = sub.depsTail;
+  if (prevDep && prevDep.dep === dep) return;
+
+  let nextDep: Link | null = null;
+  const isRecomputing = sub.flags & FLAG_RUNNING;
+  if (isRecomputing) {
+    nextDep = prevDep ? prevDep.nextDep : sub.deps;
+    if (nextDep && nextDep.dep === dep) {
+      sub.depsTail = nextDep;
+      return;
+    }
+  }
+
+  const prevSub = dep.subsTail;
+  if (
+    prevSub &&
+    prevSub.sub === sub &&
+    (!isRecomputing || isValidLink(prevSub, sub))
+  )
+    return;
+
+  const newLink =
+    // biome-ignore lint/suspicious/noAssignInExpressions: micro-optimization
+    (sub.depsTail =
+    // biome-ignore lint/suspicious/noAssignInExpressions: micro-optimization
+    dep.subsTail =
+      {
+        dep,
+        sub,
+        nextDep,
+        prevSub,
+        nextSub: null,
+      });
+
+  // biome-ignore lint/suspicious/noAssignInExpressions: micro-optimization
+  prevDep !== null ? (prevDep.nextDep = newLink) : (sub.deps = newLink);
+  // biome-ignore lint/suspicious/noAssignInExpressions: micro-optimization
+  prevSub !== null ? (prevSub.nextSub = newLink) : (dep.subs = newLink);
+};
+
+const trimDeps = (node: ConsumerNode) => {
+  const tail = node.depsTail;
+  let toRemove = tail ? tail.nextDep : node.deps;
+  while (toRemove) toRemove = unlinkSub(toRemove);
+  if (tail) tail.nextDep = null;
+  else node.deps = null;
+};
+
+const unwatchNode = (node: ConsumerNode) => {
+  let dep = node.deps;
+  while (dep) dep = unlinkSub(dep);
+  node.deps = null;
+  if (node.cleanup) runCleanup(node);
+};
+
+/* === Cleanup Management === */
+
+const runCleanup = (node: ConsumerNode) => {
+  if (!node.cleanup) return;
+
+  if (Array.isArray(node.cleanup))
+    for (let i = 0; i < node.cleanup.length; i++) node.cleanup[i]();
+  else node.cleanup();
+  node.cleanup = null;
+};
+
+export const onCleanup = (fn: Cleanup): void => {
+  if (!context) return;
+
+  const node = context;
+
+  if (!node.cleanup) node.cleanup = fn;
+  else if (Array.isArray(node.cleanup)) node.cleanup.push(fn);
+  else node.cleanup = [node.cleanup, fn];
+};
+
+/* === Propagation === */
+
+const markNode = (node: ConsumerNode, newFlag = FLAG_DIRTY) => {
+  const flags = node.flags;
+  if ((flags & (FLAG_DIRTY | FLAG_CHECK)) >= newFlag) return;
+
+  node.flags = flags | newFlag;
+
+  // Special handling for tasks: abort in-flight work when dependencies change
+  if ("state" in node && node.state === TASK_PENDING) {
+    node.controller?.abort();
+    node.controller = undefined;
+    node.state = TASK_ABORTED;
+  }
+
+  // Effects have no value field - collect them for later execution
+  if (!("value" in node) && !(flags & (FLAG_DIRTY | FLAG_CHECK))) {
+    queuedEffects.push(node as EffectNode);
+    return;
+  }
+
+  // Propagate Check to subscribers
+  for (let link = node.subs; link !== null; link = link.nextSub)
+    markNode(link.sub, FLAG_CHECK);
+};
+
+/* === Recomputation === */
+
+const recomputeMemo = (el: MemoNode<unknown & {}>) => {
+  if (el.cleanup) runCleanup(el);
+  const prevContext = context;
+  context = el;
+  el.depsTail = null;
+  el.flags = FLAG_RUNNING;
+  const value = el.fn(el.value);
+  context = prevContext;
+
+  if (el.deps) trimDeps(el);
+
+  if (!el.equals(value, el.value)) {
+    el.value = value;
+
+    for (let s = el.subs; s !== null; s = s.nextSub) {
+      const o = s.sub;
+      const flags = o.flags;
+      flags & FLAG_CHECK
+        ? // biome-ignore lint/suspicious/noAssignInExpressions: micro-optimization
+          (o.flags = flags | FLAG_DIRTY)
+        : markNode(o);
+    }
+  }
+
+  el.flags = FLAG_CLEAN;
+};
+
+const recomputeTask = (el: TaskNode<unknown & {}>) => {
+  if (el.state === TASK_PENDING) return;
+
+  el.controller?.abort();
+
+  const controller = new AbortController();
+  el.controller = controller;
+
+  const oldValue = el.value;
+
+  el.state = TASK_PENDING;
+  el.error = undefined;
+
+  if (el.cleanup) runCleanup(el);
+  const prevContext = context;
+  context = el;
+  el.depsTail = null;
+  el.flags = FLAG_RUNNING;
+
+  let promise: Promise<unknown & {}>;
+  try {
+    promise = el.fn(oldValue, controller.signal);
+
+    if (el.deps) trimDeps(el);
+  } catch (e) {
+    context = prevContext;
+    el.state = TASK_ERROR;
+    el.controller = undefined;
+    el.error = e instanceof Error ? e : new Error(String(e));
+    el.flags = FLAG_CLEAN;
+    return;
+  }
+
+  context = prevContext;
+
+  promise.then(
+    (next) => {
+      if (controller.signal.aborted) return;
+
+      el.controller = undefined;
+      el.state = TASK_IDLE;
+      el.error = undefined;
+
+      if (!el.equals(next, el.value)) {
+        el.value = next;
+
+        for (let s = el.subs; s !== null; s = s.nextSub) {
+          const o = s.sub;
+          const flags = o.flags;
+          flags & FLAG_CHECK
+            ? // biome-ignore lint/suspicious/noAssignInExpressions: micro-optimization
+              (o.flags = flags | FLAG_DIRTY)
+            : markNode(o);
+        }
+      }
+
+      el.flags = FLAG_CLEAN;
+    },
+    (err: unknown) => {
+      if (controller.signal.aborted) return;
+
+      el.controller = undefined;
+      el.state = TASK_ERROR;
+      el.error = err instanceof Error ? err : new Error(String(err));
+
+      for (let s = el.subs; s !== null; s = s.nextSub) {
+        const o = s.sub;
+        const flags = o.flags;
+        flags & FLAG_CHECK
+          ? // biome-ignore lint/suspicious/noAssignInExpressions: micro-optimization
+            (o.flags = flags | FLAG_DIRTY)
+          : markNode(o, FLAG_CHECK);
+      }
+
+      el.flags = FLAG_CLEAN;
+    },
+  );
+};
+
+const runEffect = (el: EffectNode) => {
+  if (el.cleanup) runCleanup(el);
+  const prevContext = context;
+  context = el;
+  el.depsTail = null;
+  el.flags = FLAG_RUNNING;
+  el.fn();
+  context = prevContext;
+
+  if (el.deps) trimDeps(el);
+
+  el.flags = FLAG_CLEAN;
+};
+
+const updateIfNecessary = (el: ConsumerNode): void => {
+  if (el.flags & FLAG_CHECK) {
+    for (let d = el.deps; d !== null; d = d.nextDep) {
+      if ("fn" in d.dep) updateIfNecessary(d.dep);
+      if (el.flags & FLAG_DIRTY) break;
+    }
+  }
+
+  if (el.flags & FLAG_DIRTY) {
+    if ("state" in el) recomputeTask(el as TaskNode<unknown & {}>);
+    else if ("value" in el) recomputeMemo(el as MemoNode<unknown & {}>);
+    else runEffect(el as EffectNode);
+  }
+
+  el.flags = FLAG_CLEAN;
+};
+
+/* === Batching === */
+
+const flush = (): void => {
+  for (let i = 0; i < queuedEffects.length; i++) {
+    const effect = queuedEffects[i];
+    if (effect.flags & (FLAG_DIRTY | FLAG_CHECK)) updateIfNecessary(effect);
+  }
+  queuedEffects.length = 0;
+};
+
+export const batch = (fn: () => void): void => {
+  batchDepth++;
+  try {
+    fn();
+  } finally {
+    batchDepth--;
+    if (batchDepth === 0) flush();
+  }
+};
+
+/* === Signal Creation === */
+
+export const createState = <T extends {}>(
+  value: T,
+  options?: SignalOptions<T>,
+): State<T> => {
+  validateSignalValue("State", value, options?.guard);
+
+  const node: StateNode<T> = {
+    value,
+    subs: null,
+    subsTail: null,
+    equals: options?.equals ?? DEFAULT_EQUALS,
+    guard: options?.guard,
+  };
+
+  return {
+    get(): T {
+      if (context) linkSub(node, context);
+      return node.value;
+    },
+    set(next: T): void {
+      validateSignalValue("State", next, node.guard);
+
+      if (node.equals?.(node.value, next)) return;
+      node.value = next;
+      for (let link = node.subs; link; link = link.nextSub) markNode(link.sub);
+      if (batchDepth === 0) flush();
+    },
+  };
+};
+
+export const createMemo = <T extends {}>(
+  fn: MemoCallback<T>,
+  options?: SignalOptions<T>,
+): Memo<T> => {
+  const node: MemoNode<T> = {
+    fn,
+    value: undefined as unknown as T,
+    flags: FLAG_DIRTY,
+    deps: null,
+    depsTail: null,
+    subs: null,
+    subsTail: null,
+    cleanup: null,
+    equals: options?.equals ?? DEFAULT_EQUALS,
+    guard: options?.guard,
+  };
+
+  if (currentScope) currentScope.nodes.push(node as unknown as ConsumerNode);
+
+  return {
+    get() {
+      updateIfNecessary(node as unknown as ConsumerNode);
+      if (context) linkSub(node, context);
+      return node.value;
+    },
+  };
+};
+
+export const createTask = <T extends {}>(
+  fn: TaskCallback<T>,
+  initialValue: T,
+  options?: SignalOptions<T>,
+): Task<T> => {
+  validateSignalValue("Task", initialValue, options?.guard);
+
+  const node: TaskNode<T> = {
+    cleanup: null,
+    fn,
+    value: initialValue,
+    deps: null,
+    depsTail: null,
+    subs: null,
+    subsTail: null,
+    flags: FLAG_DIRTY,
+    equals: options?.equals ?? DEFAULT_EQUALS,
+    guard: options?.guard,
+    state: TASK_IDLE,
+    controller: undefined,
+    error: undefined,
+  };
+
+  const abortTask = () => {
+    node.controller?.abort();
+    node.controller = undefined;
+    if (node.state === TASK_PENDING) node.state = TASK_ABORTED;
+  };
+
+  return {
+    get(): T {
+      updateIfNecessary(node as unknown as ConsumerNode);
+      if (context) linkSub(node, context);
+      if (node.error) throw node.error;
+      return node.value;
+    },
+    isPending(): boolean {
+      return node.state === TASK_PENDING;
+    },
+    abort(): void {
+      abortTask();
+    },
+    disconnect(): void {
+      abortTask();
+
+      let dep = node.deps;
+      while (dep) dep = unlinkSub(dep);
+      node.deps = null;
+      node.subs = null;
+      node.subsTail = null;
+      node.error = undefined;
+      node.state = TASK_IDLE;
+    },
+  };
+};
+
+export const createEffect = (fn: () => void) => {
+  const node: EffectNode = {
+    fn,
+    flags: FLAG_DIRTY,
+    deps: null,
+    depsTail: null,
+    subs: null,
+    subsTail: null,
+    cleanup: null,
+  };
+
+  if (currentScope) currentScope.nodes.push(node);
+  runEffect(node);
+
+  return () => {
+    unwatchNode(node);
+  };
+};
+
+/* === Scope Management === */
+
+export const createScope = <T>(fn: () => T): T => {
+  const prevScope = currentScope;
+  const scope: Scope = { nodes: [], cleanups: [] };
+  currentScope = scope;
+  try {
+    const result = fn();
+    rootScope = scope;
+    return result;
+  } finally {
+    currentScope = prevScope;
+  }
+};
+
+const cleanupScope = () => {
+  if (!rootScope) return;
+
+  for (const node of rootScope.nodes) unwatchNode(node);
+  rootScope.nodes.length = 0;
+
+  for (const cleanup of rootScope.cleanups) cleanup();
+  rootScope.cleanups.length = 0;
+  rootScope = null;
+};
+
 /* === Errors === */
-
-// Validation errors
-class NullishSignalValueError extends Error {
-  constructor(where: string) {
-    super(`[${where}] Signal value cannot be null or undefined`);
-    this.name = "NullishSignalValueError";
-  }
-}
-
-class InvalidSignalValueError extends Error {
-  constructor(where: string, value: unknown) {
-    super(`[${where}] Invalid signal value: ${valueString(value)}`);
-    this.name = "InvalidSignalValueError";
-  }
-}
-
-/* === Functions === */
 
 const valueString = (value: unknown): string =>
   typeof value === "string"
@@ -158,572 +595,22 @@ const validateSignalValue = <T extends {}>(
   if (guard && !guard(value)) throw new InvalidSignalValueError(where, value);
 };
 
-export function createMemo<T extends {}>(
-  fn: MemoCallback<T>,
-  options?: SignalOptions<T>,
-): Memo<T> {
-  const memo = {
-    cleanup: null,
-    fn,
-    value: undefined as unknown as T,
-    child: null,
-    deps: null,
-    depsTail: null,
-    subs: null,
-    subsTail: null,
-    flags: FLAG_DIRTY,
-    equals: options?.equals ?? ((a, b) => a === b),
-  };
-
-  return {
-    get(): T {
-      return read(memo);
-    },
-  };
-}
-
-/**
- * Create an async computed signal (Task) that awaits promises.
- */
-export function createTask<T extends {}>(
-  fn: TaskCallback<T>,
-  initialValue: T,
-  options?: SignalOptions<T>,
-): Task<T> {
-  validateSignalValue("Task", initialValue, options?.guard);
-
-  const task: TaskNode<T> = {
-    cleanup: null,
-    fn,
-    value: initialValue,
-    child: null,
-    deps: null,
-    depsTail: null,
-    subs: null,
-    subsTail: null,
-    flags: FLAG_DIRTY,
-    equals: options?.equals || ((a: unknown, b: unknown) => a === b),
-    guard: options?.guard,
-    state: TASK_IDLE,
-    controller: undefined,
-    error: undefined,
-  };
-
-  return {
-    get(): T {
-      return read(task);
-    },
-    isPending(): boolean {
-      return task.state === TASK_PENDING;
-    },
-    abort(): void {
-      abortTask(task);
-    },
-    dispose(): void {
-      disposeTask(task);
-    },
-  };
-}
-
-/**
- * Abort a task's in-flight execution.
- */
-function abortTask<T extends {}>(task: TaskNode<T>): void {
-  task.controller?.abort();
-  task.controller = undefined;
-  if (task.state === TASK_PENDING) task.state = TASK_ABORTED;
-}
-
-/**
- * Dispose a task, aborting in-flight work and unlinking from the reactive graph.
- */
-function disposeTask<T extends {}>(task: TaskNode<T>): void {
-  abortTask(task);
-
-  // Unlink from dependencies
-  let dep = task.deps;
-  while (dep) dep = unlinkSubs(dep);
-  task.deps = null;
-
-  // Run disposal callbacks
-  runCleanup(task as unknown as UnknownTask);
-
-  // Clear subscribers
-  task.subs = null;
-  task.subsTail = null;
-
-  // Keep last committed value; clear error so it doesn't throw after disposal
-  task.error = undefined;
-  task.state = TASK_IDLE;
-}
-
-export function createState<T extends {}>(
-  value: T,
-  options?: SignalOptions<T>,
-): State<T> {
-  validateSignalValue("State", value, options?.guard);
-
-  const owner = options?.owner;
-
-  const state: ProducerNode<T> = {
-    value,
-    subs: null,
-    subsTail: null,
-    equals: options?.equals ?? ((a, b) => a === b),
-    guard: options?.guard,
-  } as StateNode<T>;
-
-  if (owner) {
-    (state as ChildNode<T>).owner = owner;
-    (state as ChildNode<T>).nextChild = state as unknown as UnknownChild;
-    owner.child = state as ChildNode<T>;
-  }
-
-  return {
-    get(): T {
-      if (context) linkSub(state, context);
-      return state.value;
-    },
-    set(next: T): void {
-      if (next == null) throw new NullishSignalValueError("State");
-      if (state.guard && !state.guard(next))
-        throw new InvalidSignalValueError("State", next);
-
-      if (state.equals?.(next, state.value)) return;
-      state.value = next;
-
-      for (let link = state.subs; link; link = link.nextSub) markNode(link.sub);
-      if (!batchDepth) flush();
-    },
-  };
-}
-
-function recomputeMemo(el: UnknownMemo) {
-  runCleanup(el);
-  const prevContext = context;
-  context = el;
-  el.depsTail = null;
-  el.flags = FLAG_RUNNING;
-  const value = el.fn(el.value);
-  context = prevContext;
-
-  const depsTail = el.depsTail as Link | null;
-  let toRemove = depsTail ? depsTail.nextDep : el.deps;
-  if (toRemove) {
-    do {
-      toRemove = unlinkSubs(toRemove);
-    } while (toRemove);
-    // biome-ignore lint/suspicious/noAssignInExpressions: micro-optimization
-    depsTail ? (depsTail.nextDep = null) : (el.deps = null);
-  }
-
-  // CRITICAL: Only mark subscribers dirty if value actually changed
-  // This is the key to handling diamond dependencies correctly.
-  //
-  // In a diamond (A->B->D, A->C->D), when A changes:
-  // - B and C are marked Dirty
-  // - D is marked Check
-  // - When reading D, we check B (recomputes, value changes) and C (recomputes)
-  // - If C's value doesn't change, D stays Check (not escalated to Dirty)
-  // - D then doesn't need to recompute since its dependencies' values are stable
-  if (!el.equals?.(value, el.value)) {
-    el.value = value;
-
-    // Mark subscribers as dirty/check
-    for (let sub = el.subs; sub; sub = sub.nextSub) {
-      const o = sub.sub;
-      const flags = o.flags;
-      // If already Check, escalate to Dirty; otherwise mark as Dirty
-      flags & FLAG_CHECK
-        ? // biome-ignore lint/suspicious/noAssignInExpressions: micro-optimization
-          (o.flags = flags | FLAG_DIRTY)
-        : markNode(o);
-    }
-  }
-
-  // Clear flags after recompute
-  el.flags = FLAG_CLEAN;
-}
-
-function recomputeTask(el: UnknownTask) {
-  if (el.state === TASK_PENDING) return;
-
-  // Abort any previous run
-  el.controller?.abort();
-
-  const controller = new AbortController();
-  el.controller = controller;
-
-  const oldValue = el.value;
-
-  el.state = TASK_PENDING;
-  el.error = undefined;
-
-  runCleanup(el);
-  const prevContext = context;
-  context = el;
-  el.depsTail = null;
-  el.flags = FLAG_RUNNING;
-
-  let promise: Promise<unknown>;
-  try {
-    promise = el.fn(oldValue, controller.signal);
-
-    const depsTail = el.depsTail as Link | null;
-    let toRemove = depsTail ? depsTail.nextDep : el.deps;
-    if (toRemove) {
-      do {
-        toRemove = unlinkSubs(toRemove);
-      } while (toRemove);
-      // biome-ignore lint/suspicious/noAssignInExpressions: micro-optimization
-      depsTail ? (depsTail.nextDep = null) : (el.deps = null);
-    }
-  } catch (err) {
-    // Synchronous throw from callback: treat as immediate error, keep old committed value
-    context = prevContext;
-    el.state = TASK_ERROR;
-    el.controller = undefined;
-    el.error = err instanceof Error ? err : new Error(String(err));
-    el.flags = FLAG_CLEAN;
-    return;
-  }
-
-  context = prevContext;
-
-  promise.then(
-    (next) => {
-      if (controller.signal.aborted) return;
-
-      el.controller = undefined;
-      el.state = TASK_IDLE;
-      el.error = undefined;
-
-      // Only update if value changed
-      if (!el.equals?.(next, el.value)) {
-        el.value = next as typeof el.value;
-
-        // Mark subscribers as dirty/check
-        for (let sub = el.subs; sub; sub = sub.nextSub) {
-          const o = sub.sub;
-          const flags = o.flags;
-          flags & FLAG_CHECK
-            ? // biome-ignore lint/suspicious/noAssignInExpressions: micro-optimization
-              (o.flags = flags | FLAG_DIRTY)
-            : markNode(o, FLAG_DIRTY);
-        }
-      }
-
-      el.flags = FLAG_CLEAN;
-    },
-    (err: unknown) => {
-      if (controller.signal.aborted) return;
-
-      // On error: do not commit value; keep last committed
-      el.controller = undefined;
-      el.state = TASK_ERROR;
-      el.error = err instanceof Error ? err : new Error(String(err));
-
-      // Notify dependents so they can react/throw if they read
-      for (let sub = el.subs; sub; sub = sub.nextSub) {
-        const o = sub.sub;
-        const flags = o.flags;
-        flags & FLAG_CHECK
-          ? // biome-ignore lint/suspicious/noAssignInExpressions: micro-optimization
-            (o.flags = flags | FLAG_DIRTY)
-          : markNode(o, FLAG_CHECK);
-      }
-
-      el.flags = FLAG_CLEAN;
-    },
-  );
-}
-
-function runEffect(el: EffectNode) {
-  runCleanup(el);
-  const prevContext = context;
-  context = el;
-  el.depsTail = null;
-  el.flags = FLAG_RUNNING;
-  el.fn();
-  context = prevContext;
-
-  const depsTail = el.depsTail as Link | null;
-  let toRemove = depsTail ? depsTail.nextDep : el.deps;
-  if (toRemove) {
-    do {
-      toRemove = unlinkSubs(toRemove);
-    } while (toRemove);
-    // biome-ignore lint/suspicious/noAssignInExpressions: micro-optimization
-    depsTail ? (depsTail.nextDep = null) : (el.deps = null);
-  }
-
-  // Clear flags after recompute
-  el.flags = FLAG_CLEAN;
-}
-
-function updateIfNecessary(el: ConsumerNode): void {
-  // If marked Check, recursively update dependencies to see if we're actually dirty
-  if (el.flags & FLAG_CHECK) {
-    for (let dep = el.deps; dep; dep = dep.nextDep) {
-      "fn" in dep.dep && updateIfNecessary(dep.dep);
-      // Early exit if dependency recomputation escalated us to Dirty
-      if (el.flags & FLAG_DIRTY) break;
-    }
-  }
-
-  // Only recompute if we're actually Dirty (not just Check)
-  if (el.flags & FLAG_DIRTY) {
-    // Check if this is a Task
-    if ("state" in el) recomputeTask(el);
-    else if ("value" in el) recomputeMemo(el);
-    else runEffect(el);
-  }
-
-  // Clear flags after checking/recomputing
-  el.flags = FLAG_CLEAN;
-}
-
-// https://github.com/stackblitz/alien-signals/blob/v2.0.3/src/system.ts#L100
-function unlinkSubs(link: Link): Link | null {
-  const dep = link.dep;
-  const nextDep = link.nextDep;
-  const nextSub = link.nextSub;
-  const prevSub = link.prevSub;
-
-  // biome-ignore lint/suspicious/noAssignInExpressions: micro-optimization
-  nextSub ? (nextSub.prevSub = prevSub) : (dep.subsTail = prevSub);
-
-  prevSub
-    ? // biome-ignore lint/suspicious/noAssignInExpressions: micro-optimization
-      (prevSub.nextSub = nextSub)
-    : // biome-ignore lint/suspicious/noAssignInExpressions: micro-optimization
-      // biome-ignore lint/complexity/noCommaOperator: micro-optimization
-      ((dep.subs = nextSub), !nextSub && "fn" in dep && unwatched(dep));
-
-  return nextDep;
-}
-
-function unwatched(el: ConsumerNode) {
-  let dep = el.deps;
-  while (dep) dep = unlinkSubs(dep);
-  el.deps = null;
-  runCleanup(el);
-}
-
-// https://github.com/stackblitz/alien-signals/blob/v2.0.3/src/system.ts#L52
-function linkSub(dep: UnknownState | ConsumerNode, sub: ConsumerNode) {
-  const prevDep = sub.depsTail;
-  if (prevDep?.dep === dep) return;
-  let nextDep: Link | null = null;
-  const isRecomputing = sub.flags & FLAG_RUNNING;
-  if (isRecomputing) {
-    nextDep = prevDep ? prevDep.nextDep : sub.deps;
-    if (nextDep && nextDep.dep === dep) {
-      sub.depsTail = nextDep;
-      return;
-    }
-  }
-
-  const prevSub = dep.subsTail;
-  if (prevSub?.sub === sub && (!isRecomputing || isValidLink(prevSub, sub)))
-    return;
-  const newLink =
-    // biome-ignore lint/suspicious/noAssignInExpressions: micro-optimization
-    (sub.depsTail =
-    // biome-ignore lint/suspicious/noAssignInExpressions: micro-optimization
-    dep.subsTail =
-      {
-        dep,
-        sub,
-        nextDep,
-        prevSub,
-        nextSub: null,
-      });
-
-  // biome-ignore lint/suspicious/noAssignInExpressions: micro-optimization
-  prevDep ? (prevDep.nextDep = newLink) : (sub.deps = newLink);
-  // biome-ignore lint/suspicious/noAssignInExpressions: micro-optimization
-  prevSub ? (prevSub.nextSub = newLink) : (dep.subs = newLink);
-}
-
-// https://github.com/stackblitz/alien-signals/blob/v2.0.3/src/system.ts#L284
-function isValidLink(checkLink: Link, sub: ConsumerNode): boolean {
-  const depsTail = sub.depsTail;
-  if (depsTail) {
-    // biome-ignore lint/style/noNonNullAssertion: we know what we're doing
-    let link = sub.deps!;
-    do {
-      if (link === checkLink) return true;
-      if (link === depsTail) break;
-      // biome-ignore lint/style/noNonNullAssertion: we know what we're doing
-      link = link.nextDep!;
-    } while (link);
-  }
-  return false;
-}
-
-function read<T extends {}>(el: MemoNode<T> | TaskNode<T>): T {
-  if (el.flags & (FLAG_DIRTY | FLAG_CHECK))
-    updateIfNecessary(el as unknown as ConsumerNode);
-  if (context) linkSub(el, context);
-  if ("error" in el && el.error) throw el.error;
-  return el.value;
-}
-
-function markNode(el: ConsumerNode, newState = FLAG_DIRTY) {
-  const flags = el.flags;
-  if ((flags & (FLAG_DIRTY | FLAG_CHECK)) >= newState) return;
-
-  el.flags = flags | newState;
-
-  // Effects have no value field - collect them for later execution
-  if (!("value" in el) && !(flags & (FLAG_DIRTY | FLAG_CHECK))) {
-    queuedEffects.push(el);
-    return;
-  }
-
-  // Special handling for tasks: abort in-flight work when dependencies change
-  if ("state" in el && el.state === TASK_PENDING) {
-    el.controller?.abort();
-    el.controller = undefined;
-    el.state = TASK_ABORTED;
-  }
-
-  // Propagate Check to subscribers
-  for (let link = el.subs; link; link = link.nextSub)
-    markNode(link.sub, FLAG_CHECK);
-
-  // Propagate to firewall children
-  for (let child = el.child; child; child = child.nextChild) {
-    for (let link = child.subs; link; link = link.nextSub)
-      markNode(link.sub, FLAG_CHECK);
+export class NullishSignalValueError extends Error {
+  constructor(where: string) {
+    super(`[${where}] Signal value cannot be null or undefined`);
+    this.name = "NullishSignalValueError";
   }
 }
 
-function flush(): void {
-  for (let i = 0; i < queuedEffects.length; i++) {
-    const effect = queuedEffects[i];
-    if (effect.flags & (FLAG_DIRTY | FLAG_CHECK)) updateIfNecessary(effect);
-  }
-  queuedEffects.length = 0;
-}
-
-export function batch(fn: () => void): void {
-  batchDepth++;
-  try {
-    fn();
-  } finally {
-    batchDepth--;
-    if (batchDepth === 0) flush();
+export class InvalidSignalValueError extends Error {
+  constructor(where: string, value: unknown) {
+    super(`[${where}] Signal value ${valueString(value)} is invalid`);
+    this.name = "InvalidSignalValueError";
   }
 }
 
-export function onCleanup(fn: Cleanup): Cleanup {
-  if (!context) return fn;
+/* === Framework Export === */
 
-  const node = context;
-
-  if (!node.cleanup) node.cleanup = fn;
-  else if (Array.isArray(node.cleanup)) node.cleanup.push(fn);
-  else node.cleanup = [node.cleanup, fn];
-  return fn;
-}
-
-function runCleanup(node: UnknownMemo | UnknownTask | EffectNode): void {
-  if (!node.cleanup) return;
-
-  if (Array.isArray(node.cleanup))
-    for (let i = 0; i < node.cleanup.length; i++) node.cleanup[i]();
-  else node.cleanup();
-
-  node.cleanup = null;
-}
-
-/**
- * Create an effect scope - runs a function once and tracks all effects created within.
- * Returns a disposer that cleans up all tracked effects.
- *
- * @example
- * const dispose = effectScope(() => {
- *   createEffect(() => console.log("effect 1"));
- *   createEffect(() => console.log("effect 2"));
- * });
- * // Later: dispose() cleans up both effects
- */
-export function effectScope(fn: () => void): Cleanup {
-  // Create an effect node to act as owner
-  const owner: EffectNode = {
-    fn: () => {},
-    child: null,
-    deps: null,
-    depsTail: null,
-    subs: null,
-    subsTail: null,
-    flags: FLAG_DIRTY,
-    cleanup: null,
-  };
-
-  // Run function with owner as active context
-  const prevContext = context;
-  context = owner;
-  try {
-    fn();
-  } finally {
-    context = prevContext;
-  }
-
-  // Return disposer
-  return () => {
-    // Clean up all children (firewall signals)
-    let child = owner.child;
-    while (child) {
-      const next = child.nextChild;
-      // Unlink all subscribers of this child signal
-      let link = child.subs;
-      while (link) {
-        link = unlinkSubs(link);
-      }
-      child = next;
-    }
-    owner.child = null;
-
-    // Run disposal callbacks (effects registered via onCleanup)
-    runCleanup(owner);
-  };
-}
-
-/**
- * Create an effect that runs immediately and re-runs when dependencies change.
- * Returns a disposer function.
- */
-export function createEffect(fn: EffectCallback): Cleanup {
-  const effect: EffectNode = {
-    cleanup: null,
-    fn,
-    child: null,
-    deps: null,
-    depsTail: null,
-    subs: null,
-    subsTail: null,
-    flags: FLAG_DIRTY,
-  };
-
-  updateIfNecessary(effect); // Initial run
-
-  const cleanup = () => {
-    unwatched(effect);
-  };
-
-  // Register with active owner if present
-  if (context) onCleanup(cleanup);
-
-  return cleanup;
-}
-
-/* === Test Framework === */
-
-let scope: (() => void) | null = null;
-const cleanups = new Set<() => void>();
 export const cfxR3Framework: ReactiveFramework = {
   name: "cfxR3",
   // @ts-expect-error ReactiveFramework doesn't have non-nullable signals
@@ -741,19 +628,15 @@ export const cfxR3Framework: ReactiveFramework = {
       read: memo.get,
     };
   },
-  effect: createEffect,
+  effect: (fn) => {
+    const dispose = createEffect(fn);
+    if (currentScope) currentScope.cleanups.push(dispose);
+  },
   withBatch: (fn) => batch(fn),
   withBuild: <T>(fn: () => T) => {
-    let out!: T;
-    scope = effectScope(() => {
-      out = fn();
-    });
-    cleanups.add(scope);
-    return out;
+    return createScope(fn);
   },
   cleanup: () => {
-    for (const dispose of cleanups) dispose();
-    cleanups.clear();
-    scope = null;
+    cleanupScope();
   },
 };
