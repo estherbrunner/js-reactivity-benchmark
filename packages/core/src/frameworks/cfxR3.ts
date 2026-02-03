@@ -1,399 +1,497 @@
 import type { ReactiveFramework } from "../util/reactiveFramework";
 
-export type Cleanup = () => void;
-export type Guard<T extends {}> = (value: unknown) => value is T;
+/* === Internal Types === */
 
-type Link = {
-  dep: StateNode<unknown & {}> | ConsumerNode;
-  sub: ConsumerNode;
-  nextDep: Link | null;
-  prevSub: Link | null;
-  nextSub: Link | null;
-};
-
-type StateNode<T extends {}> = {
+type SourceFields<T extends {}> = {
   value: T;
-  subs: Link | null;
-  subsTail: Link | null;
+  sinks: Edge | null;
+  sinksTail: Edge | null;
   equals: (a: unknown, b: unknown) => boolean;
-  guard: Guard<T> | undefined;
+  guard?: Guard<T>;
 };
 
-type ConsumerNode =
-  | MemoNode<unknown & {}>
-  | TaskNode<unknown & {}>
-  | EffectNode;
-
-type MemoNode<T extends {}> = {
-  fn: (prev: T) => T;
-  value: T;
+type SinkFields = {
+  fn: unknown;
   flags: number;
-  deps: Link | null;
-  depsTail: Link | null;
-  subs: Link | null;
-  subsTail: Link | null;
-  cleanup: Cleanup | Cleanup[] | null;
-  equals: (a: unknown, b: unknown) => boolean;
-  guard: Guard<T> | undefined;
+  sources: Edge | null;
+  sourcesTail: Edge | null;
 };
 
-type TaskNode<T extends {}> = {
-  fn: (prev: T, abort: AbortSignal) => Promise<T>;
-  value: T;
-  flags: number;
-  deps: Link | null;
-  depsTail: Link | null;
-  subs: Link | null;
-  subsTail: Link | null;
+type OwnerFields = {
   cleanup: Cleanup | Cleanup[] | null;
-  equals: (a: unknown, b: unknown) => boolean;
-  guard: Guard<T> | undefined;
-  state: number;
+};
+
+type AsyncFields = {
+  status: number;
   controller: AbortController | undefined;
   error: Error | undefined;
 };
 
-type EffectNode = {
-  fn: () => void;
-  flags: number;
-  deps: Link | null;
-  depsTail: Link | null;
-  subs: Link | null;
-  subsTail: Link | null;
-  cleanup: Cleanup | Cleanup[] | null;
+type StateNode<T extends {}> = SourceFields<T>;
+
+type MemoNode<T extends {}> = SourceFields<T> &
+  SinkFields & {
+    fn: (prev: T) => T;
+  };
+
+type TaskNode<T extends {}> = SourceFields<T> &
+  SinkFields &
+  AsyncFields & {
+    fn: (prev: T, abort: AbortSignal) => Promise<T>;
+  };
+
+type EffectNode = SinkFields &
+  OwnerFields & {
+    fn: (onCleanup: (fn: Cleanup) => void) => void;
+  };
+
+type Scope = OwnerFields;
+
+type SourceNode =
+  | StateNode<unknown & {}>
+  | MemoNode<unknown & {}>
+  | TaskNode<unknown & {}>;
+type SinkNode = MemoNode<unknown & {}> | TaskNode<unknown & {}> | EffectNode;
+type OwnerNode = EffectNode | Scope;
+
+type Edge = {
+  source: SourceNode;
+  sink: SinkNode;
+  nextSource: Edge | null;
+  prevSink: Edge | null;
+  nextSink: Edge | null;
 };
 
-type Scope = {
-  nodes: ConsumerNode[];
-  cleanups: Cleanup[];
-};
+/* === Public API Types === */
 
+/**
+ * A cleanup function that can be called to dispose of resources.
+ */
+export type Cleanup = () => void;
+
+/**
+ * A type guard function that validates whether an unknown value is of type T.
+ * Used to ensure type safety when updating signals.
+ *
+ * @template T - The type to guard against
+ * @param value - The value to check
+ * @returns True if the value is of type T
+ */
+export type Guard<T extends {}> = (value: unknown) => value is T;
+
+/**
+ * A mutable reactive state container.
+ * Changes to the state will automatically propagate to dependent computations and effects.
+ *
+ * @template T - The type of value stored in the state
+ */
 export type State<T extends {}> = {
+  readonly [Symbol.toStringTag]: "State";
+
+  /**
+   * Gets the current value of the state.
+   * When called inside a memo, task, or effect, creates a dependency.
+   * @returns The current value
+   */
   get(): T;
+
+  /**
+   * Sets a new value for the state.
+   * If the new value is different (according to the equality function), all dependents will be notified.
+   * @param next - The new value to set
+   */
   set(next: T): void;
 };
 
+/**
+ * A derived reactive computation that caches its result.
+ * Automatically tracks dependencies and recomputes when they change.
+ *
+ * @template T - The type of value computed by the memo
+ */
 export type Memo<T extends {}> = {
+  readonly [Symbol.toStringTag]: "Memo";
+
+  /**
+   * Gets the current value of the memo.
+   * Recomputes if dependencies have changed since last access.
+   * When called inside another reactive context, creates a dependency.
+   * @returns The computed value
+   */
   get(): T;
 };
 
+/**
+ * An asynchronous reactive computation (colorless async).
+ * Automatically tracks dependencies and re-executes when they change.
+ * Provides abort semantics and pending state tracking.
+ *
+ * @template T - The type of value resolved by the task
+ */
 export type Task<T extends {}> = {
+  readonly [Symbol.toStringTag]: "Task";
+
+  /**
+   * Gets the current value of the task.
+   * Returns the last resolved value, even while a new computation is pending.
+   * When called inside another reactive context, creates a dependency.
+   * @returns The current value
+   */
   get(): T;
+
+  /**
+   * Checks if the task is currently executing.
+   * @returns True if a computation is in progress
+   */
   isPending(): boolean;
+
+  /**
+   * Aborts the current computation if one is running.
+   * The task's AbortSignal will be triggered.
+   */
   abort(): void;
+
+  /**
+   * Disconnects the task from its dependencies.
+   * The task will no longer react to changes.
+   */
   disconnect(): void;
 };
 
+/**
+ * A callback function for memos that computes a value based on the previous value.
+ *
+ * @template T - The type of value computed
+ * @param prev - The previous computed value
+ * @returns The new computed value
+ */
 export type MemoCallback<T extends {}> = (prev: T) => T;
+
+/**
+ * A callback function for tasks that asynchronously computes a value.
+ *
+ * @template T - The type of value computed
+ * @param prev - The previous computed value
+ * @param signal - An AbortSignal that will be triggered if the task is aborted
+ * @returns A promise that resolves to the new computed value
+ */
 export type TaskCallback<T extends {}> = (
   prev: T,
   signal: AbortSignal,
 ) => Promise<T>;
-export type EffectCallback = () => void;
 
+/**
+ * A callback function for effects that can perform side effects.
+ *
+ * @param onCleanup - A function to register cleanup callbacks that will be called before the effect re-runs or is disposed
+ */
+export type EffectCallback = (onCleanup: (fn: Cleanup) => void) => void;
+
+/**
+ * Options for configuring signal behavior.
+ *
+ * @template T - The type of value in the signal
+ */
 export type SignalOptions<T extends {}> = {
+  /**
+   * Optional type guard to validate values.
+   * If provided, will throw an error if an invalid value is set.
+   */
   guard?: Guard<T>;
+
+  /**
+   * Optional custom equality function.
+   * Used to determine if a new value is different from the old value.
+   * Defaults to reference equality (===).
+   */
   equals?: (a: unknown, b: unknown) => boolean;
+};
+
+export type ComputedOptions<T extends {}> = SignalOptions<T> & {
+  /**
+   * Optional initial value.
+   * Useful for reducer patterns so that calculations start with a value of correct type.
+   */
+  value?: T;
 };
 
 /* === Constants === */
 
-const FLAG_CLEAN = 0; // Signal value is valid, no need to recompute
-const FLAG_CHECK = 1 << 0; // Signal value might be stale, check parent nodes to decide whether to recompute
-const FLAG_DIRTY = 1 << 1; // Signal value is invalid, parents have changed, value needs to be recomputed
-const FLAG_RUNNING = 1 << 2; // Signal value is being recomputed
+const TYPE_STATE = "State";
+const TYPE_MEMO = "Memo";
+const TYPE_TASK = "Task";
 
-const TASK_IDLE = 0;
-const TASK_PENDING = 1;
-const TASK_ABORTED = 2;
-const TASK_ERROR = 3;
+const FLAG_CLEAN = 0;
+const FLAG_CHECK = 1 << 0;
+const FLAG_DIRTY = 1 << 1;
+const FLAG_RUNNING = 1 << 2;
 
-const DEFAULT_EQUALS = (a: unknown, b: unknown) => a === b;
+const ASYNC_IDLE = 0;
+const ASYNC_PENDING = 1 << 0;
+const ASYNC_ABORTED = 1 << 1;
+const ASYNC_ERROR = 1 << 2;
 
 /* === Module State === */
 
-let context: ConsumerNode | null = null;
-let currentScope: Scope | null = null;
-let rootScope: Scope | null = null;
+let activeWatcher: SinkNode | null = null;
+let activeOwner: OwnerNode | null = null;
 const queuedEffects: EffectNode[] = [];
 let batchDepth = 0;
 
+/* === Utility Functions === */
+
+const defaultEquals = (a: unknown, b: unknown) => a === b;
+
+const isFunction = /*#__PURE__*/ <T>(
+  fn: unknown,
+): fn is (...args: unknown[]) => T => typeof fn === "function";
+
+const isAsyncFunction = /*#__PURE__*/ <T>(
+  fn: unknown,
+): fn is (...args: unknown[]) => Promise<T> =>
+  typeof fn === "function" && fn.constructor.name === "AsyncFunction";
+
+const isSyncFunction = /*#__PURE__*/ <T extends unknown & { then?: undefined }>(
+  fn: unknown,
+): fn is (...args: unknown[]) => T =>
+  typeof fn === "function" && fn.constructor.name !== "AsyncFunction";
+
 /* === Link Management === */
 
-const unlinkSub = (link: Link) => {
-  const dep = link.dep;
-  const nextDep = link.nextDep;
-  const nextSub = link.nextSub;
-  const prevSub = link.prevSub;
-
-  // biome-ignore lint/suspicious/noAssignInExpressions: micro-optimization
-  nextSub !== null ? (nextSub.prevSub = prevSub) : (dep.subsTail = prevSub);
-
-  prevSub !== null
-    ? // biome-ignore lint/suspicious/noAssignInExpressions: micro-optimization
-      (prevSub.nextSub = nextSub)
-    : // biome-ignore lint/suspicious/noAssignInExpressions: micro-optimization
-      (dep.subs = nextSub);
-
-  return nextDep;
-};
-
-const isValidLink = (checkLink: Link, sub: ConsumerNode): boolean => {
-  const depsTail = sub.depsTail;
-  if (depsTail) {
-    let link = sub.deps;
-    while (link) {
-      if (link === checkLink) return true;
-      if (link === depsTail) break;
-      link = link.nextDep;
+const isValidEdge = (checkEdge: Edge, node: SinkNode): boolean => {
+  const sourcesTail = node.sourcesTail;
+  if (sourcesTail) {
+    let edge = node.sources;
+    while (edge) {
+      if (edge === checkEdge) return true;
+      if (edge === sourcesTail) break;
+      edge = edge.nextSource;
     }
   }
   return false;
 };
 
-const linkSub = (
-  dep: StateNode<unknown & {}> | ConsumerNode,
-  sub: ConsumerNode,
-) => {
-  const prevDep = sub.depsTail;
-  if (prevDep && prevDep.dep === dep) return;
+const link = (source: SourceNode, sink: SinkNode) => {
+  const prevSource = sink.sourcesTail;
+  if (prevSource?.source === source) return;
 
-  let nextDep: Link | null = null;
-  const isRecomputing = sub.flags & FLAG_RUNNING;
+  let nextSource: Edge | null = null;
+  const isRecomputing = sink.flags & FLAG_RUNNING;
   if (isRecomputing) {
-    nextDep = prevDep ? prevDep.nextDep : sub.deps;
-    if (nextDep && nextDep.dep === dep) {
-      sub.depsTail = nextDep;
+    nextSource = prevSource ? prevSource.nextSource : sink.sources;
+    if (nextSource?.source === source) {
+      sink.sourcesTail = nextSource;
       return;
     }
   }
 
-  const prevSub = dep.subsTail;
+  const prevSink = source.sinksTail;
   if (
-    prevSub &&
-    prevSub.sub === sub &&
-    (!isRecomputing || isValidLink(prevSub, sub))
+    prevSink?.sink === sink &&
+    (!isRecomputing || isValidEdge(prevSink, sink))
   )
     return;
 
-  const newLink =
+  const newEdge =
     // biome-ignore lint/suspicious/noAssignInExpressions: micro-optimization
-    (sub.depsTail =
+    (sink.sourcesTail =
     // biome-ignore lint/suspicious/noAssignInExpressions: micro-optimization
-    dep.subsTail =
-      {
-        dep,
-        sub,
-        nextDep,
-        prevSub,
-        nextSub: null,
-      });
+    source.sinksTail =
+      { source, sink, nextSource, prevSink, nextSink: null });
 
-  // biome-ignore lint/suspicious/noAssignInExpressions: micro-optimization
-  prevDep !== null ? (prevDep.nextDep = newLink) : (sub.deps = newLink);
-  // biome-ignore lint/suspicious/noAssignInExpressions: micro-optimization
-  prevSub !== null ? (prevSub.nextSub = newLink) : (dep.subs = newLink);
+  prevSource
+    ? // biome-ignore lint/suspicious/noAssignInExpressions: micro-optimization
+      (prevSource.nextSource = newEdge)
+    : // biome-ignore lint/suspicious/noAssignInExpressions: micro-optimization
+      (sink.sources = newEdge);
+  prevSink
+    ? // biome-ignore lint/suspicious/noAssignInExpressions: micro-optimization
+      (prevSink.nextSink = newEdge)
+    : // biome-ignore lint/suspicious/noAssignInExpressions: micro-optimization
+      (source.sinks = newEdge);
 };
 
-const trimDeps = (node: ConsumerNode) => {
-  const tail = node.depsTail;
-  let toRemove = tail ? tail.nextDep : node.deps;
-  while (toRemove) toRemove = unlinkSub(toRemove);
-  if (tail) tail.nextDep = null;
-  else node.deps = null;
+const unlink = (edge: Edge) => {
+  const { source, nextSource, nextSink, prevSink } = edge;
+
+  // biome-ignore lint/suspicious/noAssignInExpressions: micro-optimization
+  nextSink ? (nextSink.prevSink = prevSink) : (source.sinksTail = prevSink);
+
+  prevSink
+    ? // biome-ignore lint/suspicious/noAssignInExpressions: micro-optimization
+      (prevSink.nextSink = nextSink)
+    : // biome-ignore lint/suspicious/noAssignInExpressions: micro-optimization
+      (source.sinks = nextSink);
+
+  return nextSource;
 };
 
-const unwatchNode = (node: ConsumerNode) => {
-  let dep = node.deps;
-  while (dep) dep = unlinkSub(dep);
-  node.deps = null;
-  if (node.cleanup) runCleanup(node);
+const trimSources = (node: SinkNode) => {
+  const tail = node.sourcesTail;
+  let source = tail ? tail.nextSource : node.sources;
+  while (source) source = unlink(source);
+  if (tail) tail.nextSource = null;
+  else node.sources = null;
 };
 
 /* === Cleanup Management === */
 
-const runCleanup = (node: ConsumerNode) => {
-  if (!node.cleanup) return;
-
-  if (Array.isArray(node.cleanup))
-    for (let i = 0; i < node.cleanup.length; i++) node.cleanup[i]();
-  else node.cleanup();
-  node.cleanup = null;
+const registerCleanup = (owner: OwnerNode, fn: Cleanup): void => {
+  if (!owner.cleanup) owner.cleanup = fn;
+  else if (Array.isArray(owner.cleanup)) owner.cleanup.push(fn);
+  else owner.cleanup = [owner.cleanup, fn];
 };
 
-export const onCleanup = (fn: Cleanup): void => {
-  if (!context) return;
+const runCleanup = (owner: OwnerNode): void => {
+  if (!owner.cleanup) return;
 
-  const node = context;
-
-  if (!node.cleanup) node.cleanup = fn;
-  else if (Array.isArray(node.cleanup)) node.cleanup.push(fn);
-  else node.cleanup = [node.cleanup, fn];
+  if (Array.isArray(owner.cleanup))
+    for (let i = 0; i < owner.cleanup.length; i++) owner.cleanup[i]();
+  else owner.cleanup();
+  owner.cleanup = null;
 };
 
 /* === Propagation === */
 
-const markNode = (node: ConsumerNode, newFlag = FLAG_DIRTY) => {
+const propagate = (node: SinkNode, newFlag = FLAG_DIRTY) => {
   const flags = node.flags;
-  if ((flags & (FLAG_DIRTY | FLAG_CHECK)) >= newFlag) return;
 
-  node.flags = flags | newFlag;
+  if ("sinks" in node) {
+    if ((flags & (FLAG_DIRTY | FLAG_CHECK)) >= newFlag) return;
 
-  // Special handling for tasks: abort in-flight work when dependencies change
-  if ("state" in node && node.state === TASK_PENDING) {
-    node.controller?.abort();
-    node.controller = undefined;
-    node.state = TASK_ABORTED;
-  }
+    node.flags = flags | newFlag;
 
-  // Effects have no value field - collect them for later execution
-  if (!("value" in node) && !(flags & (FLAG_DIRTY | FLAG_CHECK))) {
+    // Abort in-flight work when sources change
+    if ("status" in node && node.status === ASYNC_PENDING) {
+      node.controller?.abort();
+      node.controller = undefined;
+      node.status = ASYNC_ABORTED;
+    }
+
+    // Propagate Check to sinks
+    for (let e = node.sinks; e; e = e.nextSink) propagate(e.sink, FLAG_CHECK);
+  } else {
+    if (flags & FLAG_DIRTY) return;
+
+    // Enqueue effect for later execution
+    node.flags = FLAG_DIRTY;
     queuedEffects.push(node as EffectNode);
-    return;
   }
-
-  // Propagate Check to subscribers
-  for (let link = node.subs; link !== null; link = link.nextSub)
-    markNode(link.sub, FLAG_CHECK);
 };
 
 /* === Recomputation === */
 
-const recomputeMemo = (el: MemoNode<unknown & {}>) => {
-  if (el.cleanup) runCleanup(el);
-  const prevContext = context;
-  context = el;
-  el.depsTail = null;
-  el.flags = FLAG_RUNNING;
-  const value = el.fn(el.value);
-  context = prevContext;
+const recomputeMemo = (node: MemoNode<unknown & {}>) => {
+  const prevWatcher = activeWatcher;
+  activeWatcher = node;
+  node.sourcesTail = null;
+  node.flags = FLAG_RUNNING;
 
-  if (el.deps) trimDeps(el);
+  const next = node.fn(node.value);
 
-  if (!el.equals(value, el.value)) {
-    el.value = value;
+  activeWatcher = prevWatcher;
 
-    for (let s = el.subs; s !== null; s = s.nextSub) {
-      const o = s.sub;
-      const flags = o.flags;
-      flags & FLAG_CHECK
-        ? // biome-ignore lint/suspicious/noAssignInExpressions: micro-optimization
-          (o.flags = flags | FLAG_DIRTY)
-        : markNode(o);
-    }
+  trimSources(node);
+  if (!node.equals(next, node.value)) {
+    node.value = next;
+    for (let e = node.sinks; e; e = e.nextSink)
+      if (e.sink.flags & FLAG_CHECK) e.sink.flags |= FLAG_DIRTY;
   }
-
-  el.flags = FLAG_CLEAN;
+  node.flags = FLAG_CLEAN;
 };
 
-const recomputeTask = (el: TaskNode<unknown & {}>) => {
-  if (el.state === TASK_PENDING) return;
+const recomputeTask = (node: TaskNode<unknown & {}>) => {
+  if (node.status === ASYNC_PENDING) return;
 
-  el.controller?.abort();
+  node.controller?.abort();
 
   const controller = new AbortController();
-  el.controller = controller;
+  node.controller = controller;
+  node.status = ASYNC_PENDING;
+  node.error = undefined;
 
-  const oldValue = el.value;
-
-  el.state = TASK_PENDING;
-  el.error = undefined;
-
-  if (el.cleanup) runCleanup(el);
-  const prevContext = context;
-  context = el;
-  el.depsTail = null;
-  el.flags = FLAG_RUNNING;
+  const prevWatcher = activeWatcher;
+  activeWatcher = node;
+  node.sourcesTail = null;
+  node.flags = FLAG_RUNNING;
 
   let promise: Promise<unknown & {}>;
   try {
-    promise = el.fn(oldValue, controller.signal);
+    promise = node.fn(node.value, controller.signal);
 
-    if (el.deps) trimDeps(el);
-  } catch (e) {
-    context = prevContext;
-    el.state = TASK_ERROR;
-    el.controller = undefined;
-    el.error = e instanceof Error ? e : new Error(String(e));
-    el.flags = FLAG_CLEAN;
+    trimSources(node);
+  } catch (err) {
+    activeWatcher = prevWatcher;
+    node.status = ASYNC_ERROR;
+    node.controller = undefined;
+    node.error = err instanceof Error ? err : new Error(String(err));
+    node.flags = FLAG_CLEAN;
     return;
   }
 
-  context = prevContext;
+  activeWatcher = prevWatcher;
 
   promise.then(
     (next) => {
       if (controller.signal.aborted) return;
 
-      el.controller = undefined;
-      el.state = TASK_IDLE;
-      el.error = undefined;
+      node.controller = undefined;
+      node.status = ASYNC_IDLE;
+      node.error = undefined;
 
-      if (!el.equals(next, el.value)) {
-        el.value = next;
-
-        for (let s = el.subs; s !== null; s = s.nextSub) {
-          const o = s.sub;
-          const flags = o.flags;
-          flags & FLAG_CHECK
-            ? // biome-ignore lint/suspicious/noAssignInExpressions: micro-optimization
-              (o.flags = flags | FLAG_DIRTY)
-            : markNode(o);
-        }
+      if (!node.equals(next, node.value)) {
+        node.value = next;
+        for (let e = node.sinks; e; e = e.nextSink)
+          if (e.sink.flags & FLAG_CHECK) e.sink.flags |= FLAG_DIRTY;
       }
-
-      el.flags = FLAG_CLEAN;
+      node.flags = FLAG_CLEAN;
     },
     (err: unknown) => {
       if (controller.signal.aborted) return;
 
-      el.controller = undefined;
-      el.state = TASK_ERROR;
-      el.error = err instanceof Error ? err : new Error(String(err));
+      node.controller = undefined;
+      node.status = ASYNC_ERROR;
+      node.error = err instanceof Error ? err : new Error(String(err));
 
-      for (let s = el.subs; s !== null; s = s.nextSub) {
-        const o = s.sub;
-        const flags = o.flags;
-        flags & FLAG_CHECK
-          ? // biome-ignore lint/suspicious/noAssignInExpressions: micro-optimization
-            (o.flags = flags | FLAG_DIRTY)
-          : markNode(o, FLAG_CHECK);
-      }
-
-      el.flags = FLAG_CLEAN;
+      for (let e = node.sinks; e; e = e.nextSink)
+        if (e.sink.flags & FLAG_CHECK) e.sink.flags |= FLAG_DIRTY;
+      node.flags = FLAG_CLEAN;
     },
   );
 };
 
-const runEffect = (el: EffectNode) => {
-  if (el.cleanup) runCleanup(el);
-  const prevContext = context;
-  context = el;
-  el.depsTail = null;
-  el.flags = FLAG_RUNNING;
-  el.fn();
-  context = prevContext;
+const runEffect = (node: EffectNode) => {
+  runCleanup(node);
+  const prevContext = activeWatcher;
+  const prevOwner = activeOwner;
+  activeWatcher = activeOwner = node;
+  node.sourcesTail = null;
+  node.flags = FLAG_RUNNING;
 
-  if (el.deps) trimDeps(el);
+  node.fn((cleanupFn) => registerCleanup(node, cleanupFn));
 
-  el.flags = FLAG_CLEAN;
+  activeWatcher = prevContext;
+  activeOwner = prevOwner;
+
+  trimSources(node);
+  node.flags = FLAG_CLEAN;
 };
 
-const updateIfNecessary = (el: ConsumerNode): void => {
-  if (el.flags & FLAG_CHECK) {
-    for (let d = el.deps; d !== null; d = d.nextDep) {
-      if ("fn" in d.dep) updateIfNecessary(d.dep);
-      if (el.flags & FLAG_DIRTY) break;
+const ensureFresh = (node: SinkNode): void => {
+  if (node.flags & FLAG_CHECK) {
+    for (let e = node.sources; e; e = e.nextSource) {
+      if ("fn" in e.source) ensureFresh(e.source as SinkNode);
+      if (node.flags & FLAG_DIRTY) break;
     }
   }
 
-  if (el.flags & FLAG_DIRTY) {
-    if ("state" in el) recomputeTask(el as TaskNode<unknown & {}>);
-    else if ("value" in el) recomputeMemo(el as MemoNode<unknown & {}>);
-    else runEffect(el as EffectNode);
+  if (node.flags & FLAG_DIRTY) {
+    if ("status" in node) recomputeTask(node);
+    else if ("value" in node) recomputeMemo(node);
+    else runEffect(node);
   }
 
-  el.flags = FLAG_CLEAN;
+  node.flags = FLAG_CLEAN;
 };
 
 /* === Batching === */
@@ -401,11 +499,31 @@ const updateIfNecessary = (el: ConsumerNode): void => {
 const flush = (): void => {
   for (let i = 0; i < queuedEffects.length; i++) {
     const effect = queuedEffects[i];
-    if (effect.flags & (FLAG_DIRTY | FLAG_CHECK)) updateIfNecessary(effect);
+    if (effect.flags & FLAG_DIRTY) ensureFresh(effect);
   }
   queuedEffects.length = 0;
 };
 
+/**
+ * Batches multiple signal updates together.
+ * Effects will not run until the batch completes.
+ * Batches can be nested; effects run when the outermost batch completes.
+ *
+ * @param fn - The function to execute within the batch
+ *
+ * @example
+ * ```ts
+ * const count = createState(0);
+ * const double = createMemo(() => count.get() * 2);
+ *
+ * batch(() => {
+ *   count.set(1);
+ *   count.set(2);
+ *   count.set(3);
+ *   // Effects run only once at the end with count = 3
+ * });
+ * ```
+ */
 export const batch = (fn: () => void): void => {
   batchDepth++;
   try {
@@ -418,83 +536,165 @@ export const batch = (fn: () => void): void => {
 
 /* === Signal Creation === */
 
+/**
+ * Creates a mutable reactive state container.
+ *
+ * @template T - The type of value stored in the state
+ * @param value - The initial value
+ * @param options - Optional configuration for the state
+ * @returns A State object with get() and set() methods
+ *
+ * @example
+ * ```ts
+ * const count = createState(0);
+ * count.set(1);
+ * console.log(count.get()); // 1
+ * ```
+ *
+ * @example
+ * ```ts
+ * // With type guard
+ * const count = createState(0, {
+ *   guard: (v): v is number => typeof v === 'number'
+ * });
+ * ```
+ */
 export const createState = <T extends {}>(
   value: T,
   options?: SignalOptions<T>,
 ): State<T> => {
-  validateSignalValue("State", value, options?.guard);
+  validateSignalValue(TYPE_STATE, value, options?.guard);
 
   const node: StateNode<T> = {
     value,
-    subs: null,
-    subsTail: null,
-    equals: options?.equals ?? DEFAULT_EQUALS,
+    sinks: null,
+    sinksTail: null,
+    equals: options?.equals ?? defaultEquals,
     guard: options?.guard,
   };
 
   return {
+    [Symbol.toStringTag]: TYPE_STATE,
     get(): T {
-      if (context) linkSub(node, context);
+      if (activeWatcher) link(node, activeWatcher);
       return node.value;
     },
-    set(next: T): void {
-      validateSignalValue("State", next, node.guard);
+    set(next: T | MemoCallback<T>): void {
+      if (isFunction<T>(next)) next = next(node.value);
+      validateSignalValue(TYPE_STATE, next, node.guard);
 
-      if (node.equals?.(node.value, next)) return;
-      node.value = next;
-      for (let link = node.subs; link; link = link.nextSub) markNode(link.sub);
+      if (node.equals(node.value, next)) return;
+      node.value = next as T;
+      for (let e = node.sinks; e; e = e.nextSink) propagate(e.sink);
       if (batchDepth === 0) flush();
     },
   };
 };
 
+/**
+ * Creates a derived reactive computation that caches its result.
+ * The computation automatically tracks dependencies and recomputes when they change.
+ * Uses lazy evaluation - only computes when the value is accessed.
+ *
+ * @template T - The type of value computed by the memo
+ * @param fn - The computation function that receives the previous value
+ * @param options - Optional configuration for the memo
+ * @returns A Memo object with a get() method
+ *
+ * @example
+ * ```ts
+ * const count = createState(0);
+ * const doubled = createMemo(() => count.get() * 2);
+ * console.log(doubled.get()); // 0
+ * count.set(5);
+ * console.log(doubled.get()); // 10
+ * ```
+ *
+ * @example
+ * ```ts
+ * // Using previous value
+ * const sum = createMemo((prev) => prev + count.get(), { value: 0, equals: Object.is });
+ * ```
+ */
 export const createMemo = <T extends {}>(
   fn: MemoCallback<T>,
-  options?: SignalOptions<T>,
+  options?: ComputedOptions<T>,
 ): Memo<T> => {
+  validateCallback(TYPE_MEMO, fn, isSyncFunction);
+  if (options?.value)
+    validateSignalValue(TYPE_MEMO, options.value, options?.guard);
+
   const node: MemoNode<T> = {
     fn,
-    value: undefined as unknown as T,
+    value: options?.value as T,
     flags: FLAG_DIRTY,
-    deps: null,
-    depsTail: null,
-    subs: null,
-    subsTail: null,
-    cleanup: null,
-    equals: options?.equals ?? DEFAULT_EQUALS,
+    sources: null,
+    sourcesTail: null,
+    sinks: null,
+    sinksTail: null,
+    equals: options?.equals ?? defaultEquals,
     guard: options?.guard,
   };
 
-  if (currentScope) currentScope.nodes.push(node as unknown as ConsumerNode);
-
   return {
+    [Symbol.toStringTag]: TYPE_MEMO,
     get() {
-      updateIfNecessary(node as unknown as ConsumerNode);
-      if (context) linkSub(node, context);
+      ensureFresh(node as unknown as SinkNode);
+      if (activeWatcher) link(node, activeWatcher);
       return node.value;
     },
   };
 };
 
+/**
+ * Creates an asynchronous reactive computation (colorless async).
+ * The computation automatically tracks dependencies and re-executes when they change.
+ * Provides abort semantics - in-flight computations are aborted when dependencies change.
+ *
+ * @template T - The type of value resolved by the task
+ * @param fn - The async computation function that receives the previous value and an AbortSignal
+ * @param options - Optional configuration for the task
+ * @returns A Task object with get(), isPending(), abort(), and disconnect() methods
+ *
+ * @example
+ * ```ts
+ * const userId = createState(1);
+ * const user = createTask(async (prev, signal) => {
+ *   const response = await fetch(`/api/users/${userId.get()}`, { signal });
+ *   return response.json();
+ * });
+ *
+ * // When userId changes, the previous fetch is aborted
+ * userId.set(2);
+ * ```
+ *
+ * @example
+ * ```ts
+ * // Check pending state
+ * if (user.isPending()) {
+ *   console.log('Loading...');
+ * }
+ * ```
+ */
 export const createTask = <T extends {}>(
   fn: TaskCallback<T>,
-  initialValue: T,
-  options?: SignalOptions<T>,
+  options?: ComputedOptions<T>,
 ): Task<T> => {
-  validateSignalValue("Task", initialValue, options?.guard);
+  validateCallback(TYPE_TASK, fn, isAsyncFunction);
+  if (options?.value)
+    validateSignalValue(TYPE_TASK, options.value, options?.guard);
 
   const node: TaskNode<T> = {
-    cleanup: null,
     fn,
-    value: initialValue,
-    deps: null,
-    depsTail: null,
-    subs: null,
-    subsTail: null,
+    value: options?.value as T,
+    sources: null,
+    sourcesTail: null,
+    sinks: null,
+    sinksTail: null,
     flags: FLAG_DIRTY,
-    equals: options?.equals ?? DEFAULT_EQUALS,
+    equals: options?.equals ?? defaultEquals,
     guard: options?.guard,
-    state: TASK_IDLE,
+    status: ASYNC_IDLE,
     controller: undefined,
     error: undefined,
   };
@@ -502,18 +702,19 @@ export const createTask = <T extends {}>(
   const abortTask = () => {
     node.controller?.abort();
     node.controller = undefined;
-    if (node.state === TASK_PENDING) node.state = TASK_ABORTED;
+    if (node.status === ASYNC_PENDING) node.status = ASYNC_ABORTED;
   };
 
   return {
+    [Symbol.toStringTag]: TYPE_TASK,
     get(): T {
-      updateIfNecessary(node as unknown as ConsumerNode);
-      if (context) linkSub(node, context);
+      ensureFresh(node as unknown as SinkNode);
+      if (activeWatcher) link(node, activeWatcher);
       if (node.error) throw node.error;
       return node.value;
     },
     isPending(): boolean {
-      return node.state === TASK_PENDING;
+      return node.status === ASYNC_PENDING;
     },
     abort(): void {
       abortTask();
@@ -521,60 +722,233 @@ export const createTask = <T extends {}>(
     disconnect(): void {
       abortTask();
 
-      let dep = node.deps;
-      while (dep) dep = unlinkSub(dep);
-      node.deps = null;
-      node.subs = null;
-      node.subsTail = null;
+      let source = node.sources;
+      while (source) source = unlink(source);
+      node.sources = node.sinks = node.sinksTail = null;
       node.error = undefined;
-      node.state = TASK_IDLE;
+      node.status = ASYNC_IDLE;
     },
   };
 };
 
-export const createEffect = (fn: () => void) => {
+/**
+ * Creates a reactive effect that automatically runs when its dependencies change.
+ * Effects run immediately upon creation and re-run when any tracked signal changes.
+ * Effects are executed during the flush phase, after all updates have been batched.
+ *
+ * @param fn - The effect function that can track dependencies and register cleanup callbacks
+ * @returns A cleanup function that can be called to dispose of the effect
+ *
+ * @example
+ * ```ts
+ * const count = createState(0);
+ * const dispose = createEffect(() => {
+ *   console.log('Count is:', count.get());
+ * });
+ *
+ * count.set(1); // Logs: "Count is: 1"
+ * dispose(); // Stop the effect
+ * ```
+ *
+ * @example
+ * ```ts
+ * // With cleanup
+ * createEffect((onCleanup) => {
+ *   const timer = setInterval(() => console.log(count.get()), 1000);
+ *   onCleanup(() => clearInterval(timer));
+ * });
+ * ```
+ */
+export const createEffect = (fn: EffectCallback): Cleanup => {
+  validateCallback("Effect", fn);
+
   const node: EffectNode = {
     fn,
     flags: FLAG_DIRTY,
-    deps: null,
-    depsTail: null,
-    subs: null,
-    subsTail: null,
+    sources: null,
+    sourcesTail: null,
     cleanup: null,
   };
 
-  if (currentScope) currentScope.nodes.push(node);
+  const dispose = () => {
+    runCleanup(node);
+    node.fn = undefined as unknown as EffectCallback;
+    node.flags = FLAG_CLEAN;
+    node.sourcesTail = null;
+    trimSources(node);
+  };
+
+  if (activeOwner) registerCleanup(activeOwner, dispose);
+
   runEffect(node);
 
-  return () => {
-    unwatchNode(node);
-  };
+  return dispose;
 };
+
+/* === Type Guards === */
+
+const isObjectOfType = /*#__PURE__*/ <T>(
+  value: unknown,
+  type: string,
+): value is T => Object.prototype.toString.call(value) === `[object ${type}]`;
+
+/**
+ * Checks if a value is a State signal.
+ *
+ * @param value - The value to check
+ * @returns True if the value is a State
+ *
+ * @example
+ * ```ts
+ * const state = createState(0);
+ * if (isState(state)) {
+ *   state.set(1); // TypeScript knows state has set()
+ * }
+ * ```
+ */
+export function isState<T extends {} = unknown & {}>(
+  value: unknown,
+): value is State<T> {
+  return isObjectOfType<State<T>>(value, TYPE_STATE);
+}
+
+/**
+ * Checks if a value is a Memo signal.
+ *
+ * @param value - The value to check
+ * @returns True if the value is a Memo
+ *
+ * @example
+ * ```ts
+ * const memo = createMemo(() => 42);
+ * if (isMemo(memo)) {
+ *   console.log(memo.get()); // TypeScript knows this is a Memo
+ * }
+ * ```
+ */
+export function isMemo<T extends {} = unknown & {}>(
+  value: unknown,
+): value is Memo<T> {
+  return isObjectOfType<Memo<T>>(value, TYPE_MEMO);
+}
+
+/**
+ * Checks if a value is a Task signal.
+ *
+ * @param value - The value to check
+ * @returns True if the value is a Task
+ *
+ * @example
+ * ```ts
+ * const task = createTask(async () => 42, null);
+ * if (isTask(task)) {
+ *   task.abort(); // TypeScript knows task has abort()
+ * }
+ * ```
+ */
+export function isTask<T extends {} = unknown & {}>(
+  value: unknown,
+): value is Task<T> {
+  return isObjectOfType<Task<T>>(value, TYPE_TASK);
+}
+
+/**
+ * Checks if a value is any kind of signal (State, Memo, or Task).
+ *
+ * @param value - The value to check
+ * @returns True if the value is a State, Memo, or Task
+ *
+ * @example
+ * ```ts
+ * function logSignal(signal: unknown) {
+ *   if (isSignal(signal)) {
+ *     console.log(signal.get()); // All signals have get()
+ *   }
+ * }
+ * ```
+ */
+export function isSignal<T extends {} = unknown & {}>(
+  value: unknown,
+): value is State<T> | Memo<T> | Task<T> {
+  return isState(value) || isMemo(value) || isTask(value);
+}
+
+/**
+ * Checks if a value is a computed signal (Memo or Task).
+ *
+ * @param value - The value to check
+ * @returns True if the value is a Memo or Task
+ *
+ * @example
+ * ```ts
+ * function processComputed(signal: unknown) {
+ *   if (isComputed(signal)) {
+ *     // signal is Memo or Task, both are read-only
+ *     console.log(signal.get());
+ *   }
+ * }
+ * ```
+ */
+export function isComputed<T extends {} = unknown & {}>(
+  value: unknown,
+): value is Memo<T> | Task<T> {
+  return isMemo(value) || isTask(value);
+}
 
 /* === Scope Management === */
 
-export const createScope = <T>(fn: () => T): T => {
-  const prevScope = currentScope;
-  const scope: Scope = { nodes: [], cleanups: [] };
-  currentScope = scope;
+/**
+ * Creates a new ownership scope for managing cleanup of nested effects and resources.
+ * All effects created within the scope will be automatically disposed when the scope is disposed.
+ * Scopes can be nested - disposing a parent scope disposes all child scopes.
+ *
+ * @template T - The type of value returned by the scope function
+ * @param fn - The function to execute within the scope, receives an onCleanup callback
+ * @returns A tuple of [result, dispose] where result is the return value of fn and dispose cleans up the scope
+ *
+ * @example
+ * ```ts
+ * const [value, dispose] = createScope((onCleanup) => {
+ *   const count = createState(0);
+ *
+ *   createEffect(() => {
+ *     console.log(count.get());
+ *   });
+ *
+ *   onCleanup(() => console.log('Scope disposed'));
+ *
+ *   return count;
+ * });
+ *
+ * dispose(); // Cleans up the effect and runs cleanup callbacks
+ * ```
+ *
+ * @example
+ * ```ts
+ * // Nested scopes
+ * const [outer, disposeOuter] = createScope(() => {
+ *   const [inner, disposeInner] = createScope(() => {
+ *     // ...
+ *   });
+ *   // disposeOuter() will also dispose inner scope
+ * });
+ * ```
+ */
+export const createScope = <T>(
+  fn: (onCleanup: (fn: Cleanup) => void) => T,
+): [T, Cleanup] => {
+  const prevOwner = activeOwner;
+  const scope: Scope = { cleanup: null };
+  activeOwner = scope;
+
   try {
-    const result = fn();
-    rootScope = scope;
-    return result;
+    const result = fn((cleanupFn) => registerCleanup(scope, cleanupFn));
+    const dispose = () => runCleanup(scope);
+    if (prevOwner) registerCleanup(prevOwner, dispose);
+    return [result, dispose];
   } finally {
-    currentScope = prevScope;
+    activeOwner = prevOwner;
   }
-};
-
-const cleanupScope = () => {
-  if (!rootScope) return;
-
-  for (const node of rootScope.nodes) unwatchNode(node);
-  rootScope.nodes.length = 0;
-
-  for (const cleanup of rootScope.cleanups) cleanup();
-  rootScope.cleanups.length = 0;
-  rootScope = null;
 };
 
 /* === Errors === */
@@ -595,22 +969,64 @@ const validateSignalValue = <T extends {}>(
   if (guard && !guard(value)) throw new InvalidSignalValueError(where, value);
 };
 
+const validateCallback = (
+  where: string,
+  value: unknown,
+  guard: (value: unknown) => boolean = isFunction,
+): void => {
+  if (!guard(value)) throw new InvalidCallbackError(where, value);
+};
+
+/**
+ * Error thrown when a signal value is null or undefined.
+ */
 export class NullishSignalValueError extends Error {
+  /**
+   * Constructs a new NullishSignalValueError.
+   *
+   * @param where - The location where the error occurred.
+   */
   constructor(where: string) {
     super(`[${where}] Signal value cannot be null or undefined`);
     this.name = "NullishSignalValueError";
   }
 }
 
+/**
+ * Error thrown when a signal value is invalid.
+ */
 export class InvalidSignalValueError extends Error {
+  /**
+   * Constructs a new InvalidSignalValueError.
+   *
+   * @param where - The location where the error occurred.
+   * @param value - The invalid value.
+   */
   constructor(where: string, value: unknown) {
     super(`[${where}] Signal value ${valueString(value)} is invalid`);
     this.name = "InvalidSignalValueError";
   }
 }
 
+/**
+ * Error thrown when a callback is invalid.
+ */
+export class InvalidCallbackError extends Error {
+  /**
+   * Constructs a new InvalidCallbackError.
+   *
+   * @param where - The location where the error occurred.
+   * @param value - The invalid value.
+   */
+  constructor(where: string, value: unknown) {
+    super(`[${where}] Callback ${valueString(value)} is invalid`);
+    this.name = "InvalidCallbackError";
+  }
+}
+
 /* === Framework Export === */
 
+let rootScope: Scope | null = null;
 export const cfxR3Framework: ReactiveFramework = {
   name: "cfxR3",
   // @ts-expect-error ReactiveFramework doesn't have non-nullable signals
@@ -629,14 +1045,18 @@ export const cfxR3Framework: ReactiveFramework = {
     };
   },
   effect: (fn) => {
-    const dispose = createEffect(fn);
-    if (currentScope) currentScope.cleanups.push(dispose);
+    createEffect(() => fn());
   },
   withBatch: (fn) => batch(fn),
   withBuild: <T>(fn: () => T) => {
-    return createScope(fn);
+    const [result, dispose] = createScope(() => fn());
+    rootScope = { cleanup: dispose };
+    return result;
   },
   cleanup: () => {
-    cleanupScope();
+    if (rootScope?.cleanup) {
+      (rootScope.cleanup as Cleanup)();
+      rootScope = null;
+    }
   },
 };

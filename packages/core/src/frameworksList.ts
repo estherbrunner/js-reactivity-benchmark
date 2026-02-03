@@ -1,7 +1,7 @@
 import type { FrameworkInfo } from "./util/frameworkTypes";
 import { alienFramework } from "./frameworks/alienSignals";
 // import { angularFramework as angularFramework2 } from "./frameworks/angularSignals2";
-import { baselineFramework } from "./frameworks/baseline";
+// import { baselineFramework } from "./frameworks/baseline";
 // import { causeEffectFramework } from "./frameworks/causeEffect";
 // import { cfxFramework } from "./frameworks/cfx";
 import { cfxR3Framework } from "./frameworks/cfxR3";
@@ -31,7 +31,7 @@ import { preactSignalFramework } from "./frameworks/preactSignals";
 export const frameworkInfo: FrameworkInfo[] = [
   { framework: alienFramework, testPullCounts: true },
   // { framework: angularFramework2, testPullCounts: true },
-  { framework: baselineFramework, testPullCounts: true },
+  // { framework: baselineFramework, testPullCounts: true },
   // { framework: causeEffectFramework, testPullCounts: true },
   // { framework: cfxFramework, testPullCounts: true },
   { framework: cfxR3Framework, testPullCounts: true },
@@ -52,7 +52,7 @@ export const frameworkInfo: FrameworkInfo[] = [
 export const allFrameworks: FrameworkInfo[] = [
   { framework: alienFramework, testPullCounts: true },
   // { framework: angularFramework2, testPullCounts: true },
-  { framework: baselineFramework, testPullCounts: true },
+  // { framework: baselineFramework, testPullCounts: true },
   // { framework: causeEffectFramework, testPullCounts: true },
   // { framework: cfxFramework, testPullCounts: true },
   { framework: cfxR3Framework, testPullCounts: true },

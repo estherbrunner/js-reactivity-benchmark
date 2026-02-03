@@ -8,10 +8,7 @@
   "scripts": {
     "tsc": "tsc",
     "test": "vitest",
-    "build": "esbuild src/index.ts --bundle --format=esm --target=esnext --outdir=dist --sourcemap=external && tsc -p tsconfig.json",
-    "bench:memory": "bun --bun --expose-gc src/runMemoryBench.ts",
-    "bench:memory:node": "node --expose-gc --loader tsx src/runMemoryBench.ts",
-    "bench:compare": "bun --bun --expose-gc src/runMemoryComparison.ts"
+    "build": "esbuild src/index.ts --bundle --format=esm --target=esnext --outdir=dist --sourcemap=external && tsc -p tsconfig.json"
   },
   "keywords": [],
   "author": "",
