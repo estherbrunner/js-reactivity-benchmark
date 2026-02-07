@@ -60,6 +60,7 @@ type SinkNode = MemoNode<unknown & {}> | TaskNode<unknown & {}> | EffectNode;
 type OwnerNode = EffectNode | Scope;
 
 type Edge = {
+  version: number;
   source: SourceNode;
   sink: SinkNode;
   nextSource: Edge | null;
@@ -248,6 +249,7 @@ let activeOwner: OwnerNode | null = null;
 const queuedEffects: EffectNode[] = [];
 let batchDepth = 0;
 let flushing = false;
+let currentVersion = 0;
 
 /* === Utility Functions === */
 
@@ -269,19 +271,6 @@ const isSyncFunction = /*#__PURE__*/ <T extends unknown & { then?: undefined }>(
 
 /* === Link Management === */
 
-const isValidEdge = (checkEdge: Edge, node: SinkNode): boolean => {
-  const sourcesTail = node.sourcesTail;
-  if (sourcesTail) {
-    let edge = node.sources;
-    while (edge) {
-      if (edge === checkEdge) return true;
-      if (edge === sourcesTail) break;
-      edge = edge.nextSource;
-    }
-  }
-  return false;
-};
-
 const link = (source: SourceNode, sink: SinkNode) => {
   const prevSource = sink.sourcesTail;
   if (prevSource?.source === source) return;
@@ -291,19 +280,23 @@ const link = (source: SourceNode, sink: SinkNode) => {
   if (isRecomputing) {
     nextSource = prevSource ? prevSource.nextSource : sink.sources;
     if (nextSource?.source === source) {
+      nextSource.version = currentVersion;
       sink.sourcesTail = nextSource;
       return;
     }
   }
 
   const prevSink = source.sinksTail;
-  if (
-    prevSink?.sink === sink &&
-    (!isRecomputing || isValidEdge(prevSink, sink))
-  )
-    return;
+  if (prevSink?.sink === sink && prevSink.version === currentVersion) return;
 
-  const newEdge = { source, sink, nextSource, prevSink, nextSink: null };
+  const newEdge = {
+    version: currentVersion,
+    source,
+    sink,
+    nextSource,
+    prevSink,
+    nextSink: null,
+  };
   sink.sourcesTail = source.sinksTail = newEdge;
   if (prevSource) prevSource.nextSource = newEdge;
   else sink.sources = newEdge;
@@ -394,6 +387,7 @@ const runCleanup = (owner: OwnerNode): void => {
 const recomputeMemo = (node: MemoNode<unknown & {}>) => {
   const prevWatcher = activeSink;
   activeSink = node;
+  ++currentVersion;
   node.sourcesTail = null;
   node.flags = FLAG_RUNNING;
 
@@ -430,6 +424,7 @@ const recomputeTask = (node: TaskNode<unknown & {}>) => {
 
   const prevWatcher = activeSink;
   activeSink = node;
+  ++currentVersion;
   node.sourcesTail = null;
   node.flags = FLAG_RUNNING;
 
@@ -483,6 +478,7 @@ const runEffect = (node: EffectNode) => {
   const prevContext = activeSink;
   const prevOwner = activeOwner;
   activeSink = activeOwner = node;
+  ++currentVersion;
   node.sourcesTail = null;
   node.flags = FLAG_RUNNING;
 
